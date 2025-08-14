@@ -5,23 +5,24 @@ import logging
 import os
 import tempfile
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import psutil 
-from browser_use.agent.actuator import Actuator
-from browser_use.agent.decision_maker import DecisionMaker
-from browser_use.agent.events import ActuationResult, Decision, PerceptionOutput 
-from browser_use.agent.gif import create_history_gif
-from browser_use.agent.message_manager.service import MessageManager, MessageManagerSettings
-from browser_use.agent.perception import Perception
-from browser_use.agent.state_manager import AgentState, AgentStatus, StateManager, agent_log, LoadStatus, TERMINAL_STATES
-from browser_use.agent.views import AgentHistory, AgentHistoryList, AgentError, ActionResult, StepMetadata
-from browser_use.browser import BrowserSession
-from browser_use.browser.views import BrowserStateHistory
-from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
-from browser_use.exceptions import AgentInterruptedError
-from browser_use.filesystem.file_system import FileSystem
-from browser_use.utils import SignalHandler
+from .actuator import Actuator
+from .decision_maker import DecisionMaker
+from .events import ActuationResult, Decision, PerceptionOutput 
+from .gif import create_history_gif
+from .message_manager.service import MessageManager, MessageManagerSettings
+from .perception import Perception
+from .state_manager import AgentState, AgentStatus, StateManager, agent_log, LoadStatus, TERMINAL_STATES
+from .task_monitor import TaskMonitor
+from .views import AgentHistory, AgentHistoryList, AgentError, ActionResult, StepMetadata
+from ..browser import BrowserSession
+from ..browser.views import BrowserStateHistory
+from ..browser.session import DEFAULT_BROWSER_PROFILE
+from ..exceptions import AgentInterruptedError
+from ..filesystem.file_system import FileSystem
+from ..utils import SignalHandler
 
 if TYPE_CHECKING:
     from browser_use.agent.settings import AgentSettings
@@ -38,6 +39,7 @@ class Supervisor:
     def __init__(self, settings: AgentSettings):
         self.settings = settings
         self._setup_components()
+        self._task_monitor: Optional[TaskMonitor] = None
 
 
     def _setup_components(self):
@@ -85,21 +87,86 @@ class Supervisor:
             if await self.state_manager.get_status() not in TERMINAL_STATES:
                 await self.state_manager.set_status(AgentStatus.RUNNING)
                 try:
-                    async with asyncio.TaskGroup() as tg:
-                        tg.create_task(self.perception.watchdog())
-                        tg.create_task(self.perception.run())
-                        tg.create_task(self._decision_loop())
-                        tg.create_task(self._actuation_loop())
-                        tg.create_task(self._pause_handler())
-                        tg.create_task(self._load_shedding_monitor()) # New: Start the load monitor
-                except* Exception as eg:
-                    await self.state_manager.set_status(AgentStatus.FAILED, force=True)
-                    for e in eg.exceptions:
+                    # Create TaskMonitor for robust restart capability
+                    self._task_monitor = TaskMonitor(max_restart_attempts=5, base_backoff=2.0, max_backoff=60.0)
+                    
+                    # Create individual tasks instead of using TaskGroup
+                    perception_watchdog_task = asyncio.create_task(self.perception.watchdog())
+                    perception_run_task = asyncio.create_task(self.perception.run())
+                    decision_loop_task = asyncio.create_task(self._decision_loop())
+                    actuation_loop_task = asyncio.create_task(self._actuation_loop())
+                    pause_handler_task = asyncio.create_task(self._pause_handler())
+                    load_shedding_task = asyncio.create_task(self._load_shedding_monitor())
+                    
+                    # Set up restart factories for each component
+                    restart_factories = {
+                        'perception_watchdog': lambda: asyncio.create_task(self.perception.watchdog()),
+                        'perception': lambda: asyncio.create_task(self.perception.run()),
+                        'decision_loop': lambda: asyncio.create_task(self._decision_loop()),
+                        'actuation_loop': lambda: asyncio.create_task(self._actuation_loop()),
+                        'pause_handler': lambda: asyncio.create_task(self._pause_handler()),
+                        'load_shedding_monitor': lambda: asyncio.create_task(self._load_shedding_monitor()),
+                    }
+                    self._task_monitor.set_restart_factories(restart_factories)
+                    
+                    # Register tasks with the monitor
+                    self._task_monitor.register('perception_watchdog', perception_watchdog_task)
+                    self._task_monitor.register('perception', perception_run_task)
+                    self._task_monitor.register('decision_loop', decision_loop_task)
+                    self._task_monitor.register('actuation_loop', actuation_loop_task)
+                    self._task_monitor.register('pause_handler', pause_handler_task)
+                    self._task_monitor.register('load_shedding_monitor', load_shedding_task)
+                    
+                    # Enable restart for critical components
+                    self._task_monitor.enable(['perception', 'decision_loop', 'actuation_loop', 'perception_watchdog'])
+                    
+                    # Wait for tasks to complete or terminal status
+                    all_tasks = [
+                        perception_watchdog_task, perception_run_task, decision_loop_task,
+                        actuation_loop_task, pause_handler_task, load_shedding_task
+                    ]
+                    
+                    try:
+                        # Wait for any task to complete or for terminal status
+                        while await self.state_manager.get_status() not in TERMINAL_STATES:
+                            # Check if any critical task has failed and isn't being restarted
+                            done_tasks = [task for task in all_tasks if task.done()]
+                            if done_tasks:
+                                # Allow some time for restart mechanism to work
+                                await asyncio.sleep(1.0)
+                                # Update task list to track new tasks created by restarts
+                                current_tasks = []
+                                if self._task_monitor:
+                                    for name in ['perception_watchdog', 'perception', 'decision_loop', 
+                                               'actuation_loop', 'pause_handler', 'load_shedding_monitor']:
+                                        task = self._task_monitor._tasks.get(name)
+                                        if task and not task.done():
+                                            current_tasks.append(task)
+                                all_tasks = current_tasks
+                            
+                            if not all_tasks:
+                                # All tasks are done, check if we should exit
+                                break
+                                
+                            await asyncio.sleep(0.5)
+                            
+                    except Exception as e:
+                        await self.state_manager.set_status(AgentStatus.FAILED, force=True)
                         await self._record_error_in_history(e)
+                        
+                except Exception as e:
+                    await self.state_manager.set_status(AgentStatus.FAILED, force=True)
+                    await self._record_error_in_history(e)
         except AgentInterruptedError:
             await self.state_manager.set_status(AgentStatus.STOPPED)
         finally:
             signal_handler.unregister()
+            
+            # Clean shutdown of task monitor
+            if self._task_monitor:
+                await self._task_monitor.close()
+                self._task_monitor = None
+                
             self._log_final_status()
             if self.settings.on_run_end: await self.settings.on_run_end(self.state_manager.state.history)
             await self.close()
