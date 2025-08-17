@@ -288,32 +288,10 @@ class Supervisor:
                         # Wait a brief moment for event loops to initialize
                         await asyncio.sleep(0.1)
 
-                        # 1. First, get initial browser state
-                        browser_state = await self.perception._get_browser_state_with_recovery()
-
-                        # 2. Create and publish initial PerceptionSnapshot directly to bypass Perception component
-                        initial_perception = PerceptionSnapshot(
-                            step_token=0,
-                            browser_state=browser_state,
-                            new_downloaded_files=None
-                        )
-
-                        # 3. Also publish StepFinalized to keep the event cycle going
-                        initial_step_event = StepFinalized(step_token=0)
-
-                        # First publish PerceptionSnapshot
+                        # Publish only an initial StepFinalized to let Perception emit the snapshot.
+                        # This avoids duplicate PerceptionSnapshots and reduces queue pressure.
                         try:
-                            self.work_bus.put_nowait(initial_perception)
-                            agent_log(logging.INFO, self.state_manager.state.agent_id, 0,
-                                     "✅ Published initial PerceptionSnapshot event to kickstart Decision and LLM components")
-                        except asyncio.QueueFull:
-                            agent_log(logging.WARNING, self.state_manager.state.agent_id, 0,
-                                     "Agent bus full, could not publish initial PerceptionSnapshot event")
-
-                        # Then publish StepFinalized
-                        try:
-                            # StepFinalized is a control event: send to control_bus if split enabled
-                            (self.control_bus if self.control_bus is not self.work_bus else self.work_bus).put_nowait(initial_step_event)
+                            (self.control_bus if self.control_bus is not self.work_bus else self.work_bus).put_nowait(StepFinalized(step_token=0))
                             agent_log(logging.INFO, self.state_manager.state.agent_id, 0,
                                      "✅ Published initial StepFinalized event to kickstart Perception component")
                         except asyncio.QueueFull:

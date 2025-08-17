@@ -136,6 +136,9 @@ class ResourceMonitor:
         self.cpu_threshold_critical = 95.0
         self.memory_threshold_warning = 80.0
         self.memory_threshold_critical = 95.0
+        # Smoothing state
+        self._ewma_cpu: Optional[float] = None
+        self._ewma_alpha: float = 0.3  # light smoothing
         # Override from settings when provided
         if settings is not None:
             try:
@@ -157,7 +160,15 @@ class ResourceMonitor:
         try:
             # System-wide CPU to avoid mismatch with Supervisor monitor.
             # interval=None uses the last computed value and is non-blocking; first call may yield 0.0
+            # Prime psutil on first call if needed
+            if self._ewma_cpu is None:
+                _ = psutil.cpu_percent(interval=0.1)
             system_cpu_percent = psutil.cpu_percent(interval=None)
+            # EWMA smoothing to reduce flapping
+            if self._ewma_cpu is None:
+                self._ewma_cpu = system_cpu_percent
+            else:
+                self._ewma_cpu = self._ewma_alpha * system_cpu_percent + (1 - self._ewma_alpha) * self._ewma_cpu
             # Process memory metrics
             memory_info = process.memory_info()
             # Prefer system memory pressure for health decisions while still reporting process RSS in MB
@@ -174,7 +185,7 @@ class ResourceMonitor:
             net_io = psutil.net_io_counters()
 
             metrics = ResourceMetrics(
-                cpu_percent=system_cpu_percent,
+                cpu_percent=self._ewma_cpu if self._ewma_cpu is not None else system_cpu_percent,
                 memory_percent=memory_percent,
                 memory_mb=memory_info.rss / 1024 / 1024,
                 disk_usage_percent=(disk_usage.used / disk_usage.total) * 100,
@@ -213,9 +224,10 @@ class ResourceMonitor:
         trends = []
         recent_metrics = self.metrics_history[-10:]
 
-        # Check for increasing CPU trend
+        # Check for increasing CPU trend, but only consider it if above warning threshold to avoid noise
         cpu_trend = sum(m.cpu_percent for m in recent_metrics[-5:]) - sum(m.cpu_percent for m in recent_metrics[:5])
-        if cpu_trend > 20:
+        avg_recent = sum(m.cpu_percent for m in recent_metrics) / len(recent_metrics)
+        if cpu_trend > 20 and avg_recent >= self.cpu_threshold_warning:
             trends.append("CPU usage increasing rapidly")
 
         # Check for memory leaks
