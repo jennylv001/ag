@@ -215,6 +215,20 @@ class Planner:
         if not self.settings.use_planner:
             return
 
+        # Drop stale assessments for older steps and avoid duplicate plans for the same step
+        try:
+            cur_step = self.state_manager.state.n_steps
+            if isinstance(event.step_token, int):
+                # Ignore if assessment pertains to a past step
+                if event.step_token < cur_step:
+                    return
+                # Debounce: if we already planned for this step via any source, skip
+                if self._last_planned_step == event.step_token:
+                    return
+        except Exception:
+            # Never fail on guard checks
+            pass
+
         now = time.monotonic()
 
         # First, ask the ModeRouter for a decision (includes hysteresis/cooldowns)

@@ -5293,6 +5293,14 @@ class BrowserSession(BaseModel):
 
 				# Always use stealth typing when stealth is enabled
 				stealth_used = await self._perform_stealth_typing(page, element_handle, text)
+				# Small delay to allow any autocomplete listbox to render
+				await asyncio.sleep(0.15)
+				# Best-effort: accept top suggestion if a visible autocomplete/listbox is present
+				try:
+					await self._accept_typeahead_if_present(element_handle)
+				except Exception:
+					# Non-fatal if suggestion handling fails
+					pass
 				return stealth_used
 			except Exception as e:
 				self.logger.debug(f'Primary stealth input method failed, trying fallback method: {e}')
@@ -5322,24 +5330,41 @@ class BrowserSession(BaseModel):
 					await element_handle.evaluate('el => {el.textContent = ""; el.value = "";}')
 					page = await self.get_current_page()
 					stealth_used = await self._perform_stealth_typing(page, element_handle, text)
+					# Allow time for suggestion list to appear and accept it if present
+					await asyncio.sleep(0.15)
+					try:
+						await self._accept_typeahead_if_present(element_handle)
+					except Exception:
+						pass
 
 					# Restore readonly attribute if it was temporarily removed
 					if readonly and not disabled:
 						await element_handle.evaluate('el => { if (el.readonlyBackup !== undefined) { el.readOnly = el.readonlyBackup; delete el.readonlyBackup; } }')
 				else:
 					# Non-stealth fallback: Try fill() first for supported elements
+					filled = False
 					try:
 						await element_handle.fill(text, timeout=3_000)  # Add 3 second timeout
 						stealth_used = False  # fill() is not stealth
+						filled = True
 					except Exception as fill_error:
-						# If fill() fails because element doesn't support it, try type() instead
-						if 'not an <input>, <textarea>, <select>' in str(fill_error):
-							self.logger.debug(f'Element does not support fill(), using type() instead: {fill_error}')
+						# If fill() fails because element doesn't support it, try stealth typing as a robust fallback
+						msg = str(fill_error)
+						if 'not an <input>, <textarea>, <select>' in msg or 'Element is not an <input>' in msg:
+							self.logger.debug(f'Element does not support fill(), using typing fallback: {fill_error}')
 							await element_handle.evaluate('el => {el.textContent = ""; el.value = "";}')
 							page = await self.get_current_page()
 							stealth_used = await self._perform_stealth_typing(page, element_handle, text)
 						else:
+							# Re-raise unexpected fill errors
 							raise
+
+					# After any non-stealth input, attempt to accept a visible suggestion list
+					try:
+						await asyncio.sleep(0.1)
+						await self._accept_typeahead_if_present(element_handle)
+					except Exception:
+						pass
 				return stealth_used
 			except Exception as e:
 				self.logger.error(f'Error during input text into element: {type(e).__name__}: {e}')
@@ -5357,6 +5382,84 @@ class BrowserSession(BaseModel):
 				f'❌ Failed to input text into element: {repr(element_node)} on page {page_url}: {type(e).__name__}: {e}'
 			)
 			raise BrowserError(f'Failed to input text into index {element_node.highlight_index}')
+
+	async def _accept_typeahead_if_present(self, element_handle) -> bool:
+		"""Detect and accept a visible autocomplete/listbox suggestion if present.
+
+		Heuristics supported:
+		- ARIA combobox/listbox patterns (role=listbox with role=option)
+		- Google Places style suggestions ('.pac-container .pac-item')
+
+		Returns True if we interacted with a suggestion or dismissed an overlay, False otherwise.
+		"""
+		try:
+			page = await self.get_current_page()
+			# Inspect DOM near the input to determine if a suggestion list is visible
+			info = await element_handle.evaluate(
+				"""
+				(el) => {
+				  const isFocused = document.activeElement === el;
+				  const visible = (node) => !!node && !!(node.offsetWidth || node.offsetHeight || node.getClientRects().length);
+				  const ownerId = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
+				  let list = ownerId ? document.getElementById(ownerId) : null;
+				  if (!list) {
+				    // Try common ARIA structure near combobox containers
+				    const combo = el.closest('[role="combobox"]');
+				    if (combo) list = combo.querySelector('[role="listbox"]');
+				  }
+				  if (!list) list = document.querySelector('[role="listbox"]');
+				  const hasAriaList = !!(list && visible(list) && list.querySelector('[role="option"]'));
+				  const pac = document.querySelector('.pac-container, .pac-multi-container');
+				  const hasPac = !!(pac && visible(pac) && (pac.querySelector('.pac-item, .pac-item-query')));
+				  return { focused: !!isFocused, hasAriaList, hasPac };
+				}
+				"""
+			)
+			focused = bool((info or {}).get('focused', False))
+			has_aria = bool((info or {}).get('hasAriaList', False))
+			has_pac = bool((info or {}).get('hasPac', False))
+
+			acted = False
+			# Prefer keyboard acceptance when ARIA listbox is active and input is focused
+			if focused and has_aria:
+				try:
+					await page.keyboard.press('ArrowDown')
+					await asyncio.sleep(0.05)
+					await page.keyboard.press('Enter')
+					acted = True
+				except Exception:
+					pass
+
+			# For Google Places-style lists, click the first visible item
+			if not acted and has_pac:
+				try:
+					await page.evaluate(
+						"""
+						() => {
+						  const pac = document.querySelector('.pac-container, .pac-multi-container');
+						  if (!pac) return false;
+						  const item = pac.querySelector('.pac-item, .pac-item-query');
+						  if (item) { (item as HTMLElement).click(); return true; }
+						  return false;
+						}
+					"""
+					)
+					acted = True
+				except Exception:
+					pass
+
+			# If an overlay still obscures the page, a soft Escape can dismiss it
+			if not acted and (has_aria or has_pac):
+				try:
+					await page.keyboard.press('Escape')
+					acted = True
+				except Exception:
+					pass
+
+			return acted
+		except Exception as e:
+			self.logger.debug(f'_accept_typeahead_if_present failed: {type(e).__name__}: {e}')
+			return False
 
 	@require_healthy_browser(usable_page=True, reopen_page=True)
 	@time_execution_async('--switch_to_tab')

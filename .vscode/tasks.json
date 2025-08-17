@@ -268,6 +268,62 @@
 			],
 			"isBackground": false,
 			"group": "build"
+		},
+		{
+			"label": "pytest - unit timing seeds",
+			"type": "shell",
+			"command": "..\\venv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"pytest",
+				"-q",
+				"tests\\unit\\test_timing_engine_seeds.py",
+				"-q"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "pytest - quick sanity",
+			"type": "shell",
+			"command": "..\\venv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"pytest",
+				"-q",
+				"tests\\e2e\\test_transition_engine.py",
+				"-q"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "pytest - unit human guidance (fixed)",
+			"type": "shell",
+			"command": "..\\venv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"pytest",
+				"-q",
+				"tests\\unit\\test_human_guidance.py",
+				"-q"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "pytest - quick sanity (one-shot)",
+			"type": "shell",
+			"command": "..\\venv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"pytest",
+				"-q",
+				"tests\\e2e\\test_transition_engine.py",
+				"-q"
+			],
+			"isBackground": false,
+			"group": "build"
 		}
 	]
 }
