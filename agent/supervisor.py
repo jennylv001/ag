@@ -556,8 +556,14 @@ class Supervisor:
                         logger.info("Long-running mode preventing terminal stop (status=%s); continuing run", next_status.value)
                         next_status = AgentStatus.RUNNING
             if next_status in TERMINAL_STATES:
-                logger.info(f"Terminal state reached: {next_status.value}. Skipping next-cycle event publication.")
-                return
+                # Allow continuation after COMPLETED when long-running mode dictates
+                if getattr(self.long_running_integration, 'enabled', False) \
+                   and getattr(self.settings, 'long_running_continue_after_complete', True) \
+                   and next_status == AgentStatus.COMPLETED:
+                    logger.info("Terminal COMPLETED reached, but continuing due to long-running mode")
+                else:
+                    logger.info(f"Terminal state reached: {next_status.value}. Skipping next-cycle event publication.")
+                    return
         else:
             # Legacy path (kept for rollback)
             # Check for task completion before processing further
@@ -639,8 +645,12 @@ class Supervisor:
 
         # Check if task was marked as completed
         if task_completed:
-            logger.info("Task completed, skipping next cycle setup")
-            return
+            # In long-running mode, continue instead of exiting after completion
+            if getattr(self.long_running_integration, 'enabled', False) and getattr(self.settings, 'long_running_continue_after_complete', True):
+                logger.info("Task completed, continuing due to long-running mode")
+            else:
+                logger.info("Task completed, skipping next cycle setup")
+                return
 
         logger.info("Getting fresh browser state for next cycle")
         try:
