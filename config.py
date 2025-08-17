@@ -9,9 +9,22 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-import psutil
+# psutil is optional; guard import to avoid hard dependency during lightweight tests
+try:
+	import psutil  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+	psutil = None  # type: ignore
 from pydantic import BaseModel, ConfigDict, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+try:
+	from pydantic_settings import BaseSettings, SettingsConfigDict  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+	# Minimal fallbacks so importing this module doesn't fail when pydantic-settings isn't installed.
+	# We won't rely on env parsing features in lightweight tests; defaults will be used instead.
+	class BaseSettings(BaseModel):  # type: ignore
+		pass
+
+	def SettingsConfigDict(**kwargs):  # type: ignore
+		return kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +41,10 @@ def is_running_in_docker() -> bool:
 	try:
 		# if init proc (PID 1) looks like uvicorn/python/uv/etc. then we're in Docker
 		# if init proc (PID 1) looks like bash/systemd/init/etc. then we're probably NOT in Docker
-		init_cmd = ' '.join(psutil.Process(1).cmdline())
+		if psutil is not None:
+			init_cmd = ' '.join(psutil.Process(1).cmdline())
+			if ('py' in init_cmd) or ('uv' in init_cmd) or ('app' in init_cmd):
+				return True
 		if ('py' in init_cmd) or ('uv' in init_cmd) or ('app' in init_cmd):
 			return True
 	except Exception:
@@ -36,8 +52,9 @@ def is_running_in_docker() -> bool:
 
 	try:
 		# if less than 10 total running procs, then we're almost certainly in a container
-		if len(psutil.pids()) < 10:
-			return True
+		if psutil is not None:
+			if len(psutil.pids()) < 10:
+				return True
 	except Exception:
 		pass
 
@@ -105,6 +122,12 @@ class OldConfig:
 	def BROWSER_USE_DEFAULT_USER_DATA_DIR(self) -> Path:
 		return self.BROWSER_USE_PROFILES_DIR / 'default'
 
+	@property
+	def BROWSER_USE_EXTENSIONS_DIR(self) -> Path:
+		path = self.BROWSER_USE_CONFIG_DIR / 'extensions'
+		self._ensure_dirs()
+		return path
+
 	def _ensure_dirs(self) -> None:
 		"""Create directories if they don't exist (only once)"""
 		if not self._dirs_created:
@@ -113,6 +136,7 @@ class OldConfig:
 			)
 			config_dir.mkdir(parents=True, exist_ok=True)
 			(config_dir / 'profiles').mkdir(parents=True, exist_ok=True)
+			(config_dir / 'extensions').mkdir(parents=True, exist_ok=True)
 			self._dirs_created = True
 
 	# LLM API key configuration

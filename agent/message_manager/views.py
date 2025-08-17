@@ -18,8 +18,8 @@ class HistoryItem(BaseModel):
     """Represents a single agent history item with its data and string representation"""
 
     step_number: int | None = None
-    evaluation_previous_goal: str | None = None
-    memory: str | None = None
+    prior_action_assessment: str | None = None
+    task_log: str | None = None
     next_goal: str | None = None
     action_results: str | None = None
     error: str | None = None
@@ -46,8 +46,8 @@ class HistoryItem(BaseModel):
 </sys>"""
         else:
             content_parts = [
-                f'Evaluation of Previous Step: {self.evaluation_previous_goal}',
-                f'Memory: {self.memory}',
+                f'Prior Action Assessment: {self.prior_action_assessment}',
+                f'Task Log: {self.task_log}',
                 f'Next Goal: {self.next_goal}',
             ]
 
@@ -79,12 +79,16 @@ class MessageHistory(BaseModel):
         messages.extend(self.consistent_messages)
 
         return messages
-        
+
 class MessageManagerSettings(BaseModel):
     """Configuration settings for the MessageManager."""
     max_input_tokens: int = Field(
         default=128000,
         description="The maximum number of tokens to be sent to the LLM."
+    )
+    max_clickable_elements_length: int = Field(
+        default=12000,
+        description="Max characters of clickable elements text to include in prompts (truncated to reduce latency)."
     )
     include_attributes: list[str] = Field(
         default=DEFAULT_INCLUDE_ATTRIBUTES,
@@ -130,7 +134,7 @@ class MessageManagerSettings(BaseModel):
         default=5,
         description="Number of recent turns to prioritize during truncation."
     )
-    
+
 
 class MessageManagerState(BaseModel):
     """Holds the state for MessageManager"""

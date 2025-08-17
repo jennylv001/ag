@@ -3,11 +3,9 @@ Cloud sync service for sending events to the Browser Use cloud.
 """
 
 import asyncio
-import json
 import logging
 import shutil
 
-import anyio
 import httpx
 from bubus import BaseEvent
 
@@ -39,7 +37,6 @@ class CloudSync:
 			# Start authentication flow on first step (after first LLM response)
 			if event.event_type == 'CreateAgentStepEvent' and 'step' in dict(event):
 				step = dict(event)['step']
-				# logger.debug(f'Got CreateAgentStepEvent with step={step}')
 				# Trigger on the first step (step=2 because n_steps is incremented before actions)
 				if step == 2 and self.enable_auth and self.auth_client:
 					if not hasattr(self, 'auth_task') or self.auth_task is None:
@@ -132,7 +129,7 @@ class CloudSync:
 				await self._resend_pending_events()
 
 				# Update WAL events with real user_id
-				await self._update_wal_user_ids(agent_session_id)
+				# await self._update_wal_user_ids(agent_session_id)
 
 		except Exception as e:
 			logger.debug(f'Cloud sync authentication failed: {e}')
@@ -151,39 +148,39 @@ class CloudSync:
 
 		self.pending_events.clear()
 
-	async def _update_wal_user_ids(self, session_id: str) -> None:
-		"""Update user IDs in WAL file after authentication"""
-		try:
-			assert self.auth_client, 'Cloud sync must be authenticated to update WAL user ID'
+	# async def _update_wal_user_ids(self, session_id: str) -> None:
+	# 	"""Update user IDs in WAL file after authentication"""
+	# 	try:
+	# 		assert self.auth_client, 'Cloud sync must be authenticated to update WAL user ID'
 
-			wal_path = CONFIG.BROWSER_USE_CONFIG_DIR / 'events' / f'{session_id}.jsonl'
-			if not await anyio.Path(wal_path).exists():
-				raise FileNotFoundError(
-					f'CloudSync failed to update saved event user_ids after auth: Agent EventBus WAL file not found: {wal_path}'
-				)
+	# 		wal_path = CONFIG.BROWSER_USE_CONFIG_DIR / 'events' / f'{session_id}.jsonl'
+	# 		if not await anyio.Path(wal_path).exists():
+	# 			raise FileNotFoundError(
+	# 				f'CloudSync failed to update saved event user_ids after auth: Agent EventBus WAL file not found: {wal_path}'
+	# 			)
 
-			# Read all events
-			events = []
-			content = await anyio.Path(wal_path).read_text()
-			for line in content.splitlines():
-				if line.strip():
-					events.append(json.loads(line))
+	# 		# Read all events
+	# 		events = []
+	# 		content = await anyio.Path(wal_path).read_text()
+	# 		for line in content.splitlines():
+	# 			if line.strip():
+	# 				events.append(json.loads(line))
 
-			# Update user_id and device_id
-			user_id = self.auth_client.user_id
-			device_id = self.auth_client.device_id
-			for event in events:
-				if 'user_id' in event:
-					event['user_id'] = user_id
-				# Add device_id to all events
-				event['device_id'] = device_id
+	# 		# Update user_id and device_id
+	# 		user_id = self.auth_client.user_id
+	# 		device_id = self.auth_client.device_id
+	# 		for event in events:
+	# 			if 'user_id' in event:
+	# 				event['user_id'] = user_id
+	# 			# Add device_id to all events
+	# 			event['device_id'] = device_id
 
-			# Write back
-			updated_content = '\n'.join(json.dumps(event) for event in events) + '\n'
-			await anyio.Path(wal_path).write_text(updated_content)
+	# 		# Write back
+	# 		updated_content = '\n'.join(json.dumps(event) for event in events) + '\n'
+	# 		await anyio.Path(wal_path).write_text(updated_content)
 
-		except Exception as e:
-			logger.warning(f'Failed to update WAL user IDs: {e}')
+	# 	except Exception as e:
+	# 		logger.warning(f'Failed to update WAL user IDs: {e}')
 
 	async def wait_for_auth(self) -> None:
 		"""Wait for authentication to complete if in progress"""

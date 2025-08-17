@@ -22,9 +22,6 @@ class ChatOllama(BaseChatModel):
 
 	model: str
 
-	# # Model params
-	# temperature: float | None = None
-
 	# Client initialization parameters
 	host: str | None = None
 	timeout: float | httpx.Timeout | None = None

@@ -2,45 +2,102 @@
 
 import sys
 
-from patchright._impl._errors import TargetClosedError as PatchrightTargetClosedError
-from patchright.async_api import Browser as PatchrightBrowser
-from patchright.async_api import BrowserContext as PatchrightBrowserContext
-from patchright.async_api import ElementHandle as PatchrightElementHandle
-from patchright.async_api import FrameLocator as PatchrightFrameLocator
-from patchright.async_api import Page as PatchrightPage
-from patchright.async_api import Playwright as Patchright
-from patchright.async_api import async_playwright as _async_patchright
-from playwright._impl._errors import TargetClosedError as PlaywrightTargetClosedError
-from playwright.async_api import Browser as PlaywrightBrowser
-from playwright.async_api import BrowserContext as PlaywrightBrowserContext
-from playwright.async_api import ElementHandle as PlaywrightElementHandle
-from playwright.async_api import FrameLocator as PlaywrightFrameLocator
-from playwright.async_api import Page as PlaywrightPage
-from playwright.async_api import Playwright as Playwright
-from playwright.async_api import async_playwright as _async_playwright
+try:
+	from patchright._impl._errors import TargetClosedError as PatchrightTargetClosedError  # type: ignore
+	from patchright.async_api import Browser as PatchrightBrowser  # type: ignore
+	from patchright.async_api import BrowserContext as PatchrightBrowserContext  # type: ignore
+	from patchright.async_api import ElementHandle as PatchrightElementHandle  # type: ignore
+	from patchright.async_api import FrameLocator as PatchrightFrameLocator  # type: ignore
+	from patchright.async_api import Page as PatchrightPage  # type: ignore
+	from patchright.async_api import Playwright as Patchright  # type: ignore
+	from patchright.async_api import async_playwright as _async_patchright  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+	PatchrightTargetClosedError = type("PatchrightTargetClosedError", (Exception,), {})  # type: ignore
+	PatchrightBrowser = object  # type: ignore
+	PatchrightBrowserContext = object  # type: ignore
+	PatchrightElementHandle = object  # type: ignore
+	PatchrightFrameLocator = object  # type: ignore
+	PatchrightPage = object  # type: ignore
+	class Patchright:  # type: ignore
+		pass
+	def _async_patchright():  # type: ignore
+		raise RuntimeError("patchright is not available")
+
+try:
+	from playwright._impl._errors import TargetClosedError as PlaywrightTargetClosedError  # type: ignore
+	from playwright.async_api import Browser as PlaywrightBrowser  # type: ignore
+	from playwright.async_api import BrowserContext as PlaywrightBrowserContext  # type: ignore
+	from playwright.async_api import ElementHandle as PlaywrightElementHandle  # type: ignore
+	from playwright.async_api import FrameLocator as PlaywrightFrameLocator  # type: ignore
+	from playwright.async_api import Page as PlaywrightPage  # type: ignore
+	from playwright.async_api import Playwright as Playwright  # type: ignore
+	from playwright.async_api import async_playwright as _async_playwright  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+	PlaywrightTargetClosedError = type("PlaywrightTargetClosedError", (Exception,), {})  # type: ignore
+	PlaywrightBrowser = object  # type: ignore
+	PlaywrightBrowserContext = object  # type: ignore
+	PlaywrightElementHandle = object  # type: ignore
+	PlaywrightFrameLocator = object  # type: ignore
+	PlaywrightPage = object  # type: ignore
+	class Playwright:  # type: ignore
+		pass
+	def _async_playwright():  # type: ignore
+		raise RuntimeError("playwright is not available")
 
 # Define types to be Union[Patchright, Playwright]
-Browser = PatchrightBrowser | PlaywrightBrowser
-BrowserContext = PatchrightBrowserContext | PlaywrightBrowserContext
-Page = PatchrightPage | PlaywrightPage
-ElementHandle = PatchrightElementHandle | PlaywrightElementHandle
-FrameLocator = PatchrightFrameLocator | PlaywrightFrameLocator
-Playwright = Playwright
-Patchright = Patchright
-PlaywrightOrPatchright = Patchright | Playwright
-TargetClosedError = PatchrightTargetClosedError | PlaywrightTargetClosedError
+Browser = PatchrightBrowser | PlaywrightBrowser  # type: ignore
+BrowserContext = PatchrightBrowserContext | PlaywrightBrowserContext  # type: ignore
+Page = PatchrightPage | PlaywrightPage  # type: ignore
+ElementHandle = PatchrightElementHandle | PlaywrightElementHandle  # type: ignore
+FrameLocator = PatchrightFrameLocator | PlaywrightFrameLocator  # type: ignore
+Playwright = Playwright  # type: ignore
+Patchright = Patchright  # type: ignore
+PlaywrightOrPatchright = Patchright | Playwright  # type: ignore
+TargetClosedError = PatchrightTargetClosedError | PlaywrightTargetClosedError  # type: ignore
 
 async_patchright = _async_patchright
 async_playwright = _async_playwright
 
-from playwright._impl._api_structures import (
-	ClientCertificate,
-	Geolocation,
-	HttpCredentials,
-	ProxySettings,
-	StorageState,
-	ViewportSize,
-)
+try:
+	from playwright._impl._api_structures import (  # type: ignore
+		ClientCertificate,
+		Geolocation,
+		HttpCredentials,
+		ProxySettings,
+		StorageState,
+		ViewportSize,
+	)
+except Exception:  # pragma: no cover - optional dependency fallback
+	# Provide minimal structural stand-ins for pydantic typing using TypedDicts
+	try:
+		from typing_extensions import TypedDict  # type: ignore
+	except Exception:
+		from typing import TypedDict  # type: ignore
+
+	class ClientCertificate(TypedDict, total=False):  # type: ignore
+		pass
+
+	class Geolocation(TypedDict, total=False):  # type: ignore
+		latitude: float
+		longitude: float
+		accuracy: float
+
+	class HttpCredentials(TypedDict, total=False):  # type: ignore
+		username: str
+		password: str
+
+	class ProxySettings(TypedDict, total=False):  # type: ignore
+		server: str
+		username: str
+		password: str
+
+	class StorageState(TypedDict, total=False):  # type: ignore
+		cookies: list[dict]
+		origins: list[dict]
+
+	class ViewportSize(TypedDict, total=False):  # type: ignore
+		width: int
+		height: int
 
 # fix pydantic error on python 3.11
 # PydanticUserError: Please use `typing_extensions.TypedDict` instead of `typing.TypedDict` on Python < 3.12.

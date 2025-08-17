@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/servers/main/src/config-schema.json",
+  "servers": {
+    "sequential-thinking": {
+      "command": "npx",
+      "args": [
+        "@modelcontextprotocol/server-sequential-thinking"
+      ],
+      "env": {},
+      "timeout": 30000,
+      "description": "Sequential thinking server for step-by-step problem solving and advanced reasoning capabilities. Supports branching thoughts, revision, and adaptive thinking patterns."
+    },
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp"
+      ],
+      "env": {},
+      "timeout": 30000,
+      "description": "Playwright MCP server for browser automation, testing, and web interaction capabilities."
+    }
+  },
+  "version": "1.0.0"
+}

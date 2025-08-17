@@ -24,7 +24,7 @@ try:
 	from textual.containers import Container, HorizontalGroup, VerticalScroll
 	from textual.widgets import Footer, Header, Input, Label, Link, RichLog, Static
 except ImportError:
-	print('⚠️ CLI addon is not installed. Please install it with: `pip install browser-use[cli]` and try again.')
+	print('⚠️ CLI addon is not installed. Please install it with: `pip install "browser-use[cli]"` and try again.')
 	sys.exit(1)
 
 
@@ -59,22 +59,22 @@ USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Logo components with styling for rich panels
 BROWSER_LOGO = """
-				   [white]   ++++++   +++++++++   [/]                                
-				   [white] +++     +++++     +++  [/]                                
-				   [white] ++    ++++   ++    ++  [/]                                
-				   [white] ++  +++       +++  ++  [/]                                
-				   [white]   ++++          +++    [/]                                
-				   [white]  +++             +++   [/]                                
-				   [white] +++               +++  [/]                                
-				   [white] ++   +++      +++  ++  [/]                                
-				   [white] ++    ++++   ++    ++  [/]                                
-				   [white] +++     ++++++    +++  [/]                                
-				   [white]   ++++++    +++++++    [/]                                
+				   [white]   ++++++   +++++++++   [/]
+				   [white] +++     +++++     +++  [/]
+				   [white] ++    ++++   ++    ++  [/]
+				   [white] ++  +++       +++  ++  [/]
+				   [white]   ++++          +++    [/]
+				   [white]  +++             +++   [/]
+				   [white] +++               +++  [/]
+				   [white] ++   +++      +++  ++  [/]
+				   [white] ++    ++++   ++    ++  [/]
+				   [white] +++     ++++++    +++  [/]
+				   [white]   ++++++    +++++++    [/]
 
 [white]██████╗ ██████╗  ██████╗ ██╗    ██╗███████╗███████╗██████╗[/]     [darkorange]██╗   ██╗███████╗███████╗[/]
 [white]██╔══██╗██╔══██╗██╔═══██╗██║    ██║██╔════╝██╔════╝██╔══██╗[/]    [darkorange]██║   ██║██╔════╝██╔════╝[/]
-[white]██████╔╝██████╔╝██║   ██║██║ █╗ ██║███████╗█████╗  ██████╔╝[/]    [darkorange]██║   ██║███████╗█████╗[/]  
-[white]██╔══██╗██╔══██╗██║   ██║██║███╗██║╚════██║██╔══╝  ██╔══██╗[/]    [darkorange]██║   ██║╚════██║██╔══╝[/]  
+[white]██████╔╝██████╔╝██║   ██║██║ █╗ ██║███████╗█████╗  ██████╔╝[/]    [darkorange]██║   ██║███████╗█████╗[/]
+[white]██╔══██╗██╔══██╗██║   ██║██║███╗██║╚════██║██╔══╝  ██╔══██╗[/]    [darkorange]██║   ██║╚════██║██╔══╝[/]
 [white]██████╔╝██║  ██║╚██████╔╝╚███╔███╔╝███████║███████╗██║  ██║[/]    [darkorange]╚██████╔╝███████║███████╗[/]
 [white]╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚══╝╚══╝ ╚══════╝╚══════╝╚═╝  ╚═╝[/]     [darkorange]╚═════╝ ╚══════╝╚══════╝[/]
 """
@@ -257,27 +257,27 @@ class BrowserUseApp(App):
 		height: 100%;
 		layout: vertical;
 	}
-	
+
 	#logo-panel, #links-panel, #paths-panel, #info-panels {
 		border: solid $primary;
-		margin: 0 0 0 0; 
+		margin: 0 0 0 0;
 		padding: 0;
 	}
-	
+
 	#info-panels {
 		display: none;
 		layout: vertical;
 		height: auto;
 		min-height: 5;
 	}
-	
+
 	#top-panels {
 		layout: horizontal;
 		height: auto;
 		width: 100%;
 		min-height: 5;
 	}
-	
+
 	#browser-panel, #model-panel {
 		width: 1fr;
 		height: auto;
@@ -287,7 +287,7 @@ class BrowserUseApp(App):
 		margin: 0 1 0 0;
 		padding: 1;
 	}
-	
+
 	#tasks-panel {
 		width: 100%;
 		height: 1fr;
@@ -298,41 +298,41 @@ class BrowserUseApp(App):
 		overflow-y: scroll;
 		margin: 1 0 0 0;
 	}
-	
+
 	#browser-panel {
 		border-left: solid $primary-darken-2;
 	}
-	
+
 	#results-container {
 		display: none;
 	}
-	
+
 	#logo-panel {
 		width: 100%;
 		height: auto;
 		content-align: center middle;
 		text-align: center;
 	}
-	
+
 	#links-panel {
 		width: 100%;
 		padding: 1;
 		border: solid $primary;
 		height: auto;
 	}
-	
+
 	.link-white {
 		color: white;
 	}
-	
+
 	.link-purple {
 		color: purple;
 	}
-	
+
 	.link-magenta {
 		color: magenta;
 	}
-	
+
 	.link-green {
 		color: green;
 	}
@@ -340,24 +340,24 @@ class BrowserUseApp(App):
 	HorizontalGroup {
 		height: auto;
 	}
-	
+
 	.link-label {
 		width: auto;
 	}
-	
+
 	.link-url {
 		width: auto;
 	}
-	
+
 	.link-row {
 		width: 100%;
 		height: auto;
 	}
-	
+
 	#paths-panel {
 		color: $text-muted;
 	}
-	
+
 	#task-input-container {
 		border: solid $accent;
 		padding: 1;
@@ -365,34 +365,34 @@ class BrowserUseApp(App):
 		height: auto;
 		dock: bottom;
 	}
-	
+
 	#task-label {
 		color: $accent;
 		padding-bottom: 1;
 	}
-	
+
 	#task-input {
 		width: 100%;
 	}
-	
+
 	#working-panel {
 		border: solid $warning;
 		padding: 1;
 		margin: 1 0;
 	}
-	
+
 	#completion-panel {
 		border: solid $success;
 		padding: 1;
 		margin: 1 0;
 	}
-	
+
 	#results-container {
 		height: 1fr;
 		overflow: auto;
 		border: none;
 	}
-	
+
 	#results-log {
 		height: auto;
 		overflow-y: scroll;
@@ -400,12 +400,12 @@ class BrowserUseApp(App):
 		color: $text;
 		width: 100%;
 	}
-	
+
 	.log-entry {
 		margin: 0;
 		padding: 0;
 	}
-	
+
 	#browser-info, #model-info, #tasks-info {
 		height: auto;
 		margin: 0;
@@ -820,18 +820,18 @@ class BrowserUseApp(App):
 			# Show token usage statistics if agent exists and has history
 			if self.agent and hasattr(self.agent, 'state') and hasattr(self.agent.state, 'history'):
 				# Get total tokens used
-				# total_tokens = self.agent.state.history.total_input_tokens()
+				# total_tokens = self.agent.history.total_input_tokens()
 				# model_info.write(f'[white]Input tokens:[/] [green]{total_tokens:,}[/]')
 
 				# Calculate tokens per step
-				num_steps = len(self.agent.state.history.history)
+				num_steps = len(self.agent.history.history)
 				# if num_steps > 0:
 				# avg_tokens_per_step = total_tokens / num_steps
 				# model_info.write(f'[white]Avg tokens/step:[/] [green]{avg_tokens_per_step:,.1f}[/]')
 
 				# Get the last step metadata to show the most recent LLM response time
-				if num_steps > 0 and self.agent.state.history.history[-1].metadata:
-					last_step = self.agent.state.history.history[-1]
+				if num_steps > 0 and self.agent.history.history[-1].metadata:
+					last_step = self.agent.history.history[-1]
 					if last_step.metadata:
 						step_duration = last_step.metadata.duration_seconds
 					else:
@@ -843,7 +843,7 @@ class BrowserUseApp(App):
 					# 	model_info.write(f'[white]Avg tokens/sec:[/] [magenta]{tokens_per_second:.1f}[/]')
 
 				# Show total duration
-				total_duration = self.agent.state.history.total_duration_seconds()
+				total_duration = self.agent.history.total_duration_seconds()
 				if total_duration > 0:
 					model_info.write(f'[white]Total Duration:[/] [magenta]{total_duration:.2f}s[/]')
 
@@ -896,7 +896,7 @@ class BrowserUseApp(App):
 			# Get all agent history items
 			history_items = []
 			if hasattr(self.agent, 'state') and hasattr(self.agent.state, 'history'):
-				history_items = self.agent.state.history.history
+				history_items = self.agent.history.history
 
 				if history_items:
 					tasks_info.write('[bold yellow]STEPS:[/]')
@@ -927,7 +927,7 @@ class BrowserUseApp(App):
 								tasks_info.write(f'   [cyan]Goal:[/] {goal_summary}')
 
 							# Show evaluation of previous goal (feedback)
-							eval_prev = item.model_output.current_state.evaluation_previous_goal
+							eval_prev = item.model_output.current_state.prior_action_assessment
 							if eval_prev and idx > 1:  # Only show for steps after the first
 								eval_lines = eval_prev.strip().split('\n')
 								eval_summary = eval_lines[0]

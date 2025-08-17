@@ -15,6 +15,7 @@ from browser_use.dom.views import (
 	SelectorMap,
 	ViewportInfo,
 )
+from browser_use.observability import observe_debug
 from browser_use.utils import is_new_tab_page, time_execution_async
 
 # @dataclass
@@ -34,6 +35,7 @@ class DomService:
 		self.js_code = resources.files('browser_use.dom.dom_tree').joinpath('index.js').read_text()
 
 	# region - Clickable elements
+	@observe_debug(ignore_input=True, ignore_output=True, name='get_clickable_elements')
 	@time_execution_async('--get_clickable_elements')
 	async def get_clickable_elements(
 		self,
@@ -72,8 +74,8 @@ class DomService:
 		if await self.page.evaluate('1+1') != 2:
 			raise ValueError('The page cannot evaluate javascript code properly')
 
-		if is_new_tab_page(self.page.url):
-			# short-circuit if the page is a new empty tab for speed, no need to inject buildDomTree.js
+		if is_new_tab_page(self.page.url) or self.page.url.startswith('chrome://'):
+			# short-circuit if the page is a new empty tab or chrome:// page for speed, no need to inject buildDomTree.js
 			return (
 				DOMElementNode(
 					tag_name='body',
@@ -98,9 +100,7 @@ class DomService:
 		}
 
 		try:
-			self.logger.debug(f'🔧 Starting JavaScript DOM analysis for {self.page.url[:50]}...')
 			eval_page: dict = await self.page.evaluate(self.js_code, args)
-			self.logger.debug('✅ JavaScript DOM analysis completed')
 		except Exception as e:
 			self.logger.error('Error evaluating JavaScript: %s', e)
 			raise
@@ -130,9 +130,7 @@ class DomService:
 				# processed_nodes,
 			)
 
-		self.logger.debug('🔄 Starting Python DOM tree construction...')
 		result = await self._construct_dom_tree(eval_page)
-		self.logger.debug('✅ Python DOM tree construction completed')
 		return result
 
 	@time_execution_async('--construct_dom_tree')

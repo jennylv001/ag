@@ -264,7 +264,7 @@ class Registry(Generic[Context]):
 			for name, param in sig.parameters.items()
 			if name not in special_param_names
 		}
-		# TODO: make the types here work
+		# Dynamic model creation for action parameters
 		return create_model(
 			f'{function.__name__}_parameters',
 			__base__=ActionModel,

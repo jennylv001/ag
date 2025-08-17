@@ -4,14 +4,15 @@ import os
 import platform
 import signal
 import time
-import re
 from collections.abc import Callable, Coroutine
 from fnmatch import fnmatch
 from functools import cache, wraps
 from pathlib import Path
 from sys import stderr
 from typing import Any, ParamSpec, TypeVar, Dict, Optional
-from urllib.parse import urlparse 
+import inspect
+from urllib.parse import urlparse
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -39,6 +40,18 @@ R = TypeVar('R')
 T = TypeVar('T')
 P = ParamSpec('P')
 
+# Keep a single active signal handler per process to avoid duplicate prompts
+_active_signal_handler: "SignalHandler | None" = None
+# Global lock to prevent multiple concurrent pause prompts across all handlers
+_global_pause_active = False
+# Global flag to avoid printing the resume prompt repeatedly
+_global_prompt_printed = False
+# Last time we printed the prompt (for global throttling)
+_global_prompt_last_ts: float | None = None
+# Global waiter task so only one input waiter is active process-wide
+_global_waiter_task: asyncio.Task | None = None
+_global_waiter_active: bool = False
+
 
 class SignalHandler:
 	"""
@@ -61,6 +74,7 @@ class SignalHandler:
 		custom_exit_callback: Callable[[], None] | None = None,
 		exit_on_second_int: bool = True,
 		interruptible_task_patterns: list[str] | None = None,
+		guidance_callback: Callable[[str], None] | None = None,
 	):
 		"""
 		Initialize the signal handler.
@@ -81,9 +95,14 @@ class SignalHandler:
 		self.exit_on_second_int = exit_on_second_int
 		self.interruptible_task_patterns = interruptible_task_patterns or ['step', 'multi_act', 'get_next_action']
 		self.is_windows = platform.system() == 'Windows'
+		self.guidance_callback = guidance_callback
 
 		# Initialize loop state attributes
 		self._initialize_loop_state()
+		# Prevent multiple concurrent resume waiters
+		self._resume_waiter_active = False
+		self._last_prompt_ts: float | None = None
+		self._waiter_task: asyncio.Task | None = None
 
 		# Store original signal handlers to restore them later if needed
 		self.original_sigint_handler = None
@@ -97,16 +116,27 @@ class SignalHandler:
 	def register(self) -> None:
 		"""Register signal handlers for SIGINT and SIGTERM."""
 		try:
+			# Idempotency and singleton guard
+			global _active_signal_handler
+			if getattr(self, '_is_registered', False):
+				return
+			# If another handler is active, try to unregister it first
+			if _active_signal_handler and _active_signal_handler is not self:
+				try:
+					_active_signal_handler.unregister()
+				except Exception:
+					pass
 			if self.is_windows:
-				# On Windows, use simple signal handling with immediate exit on Ctrl+C
-				def windows_handler(sig, frame):
-					print('\n\n🛑 Got Ctrl+C. Exiting immediately on Windows...\n', file=stderr)
-					# Run the custom exit callback if provided
-					if self.custom_exit_callback:
-						self.custom_exit_callback()
-					os._exit(0)
-
-				self.original_sigint_handler = signal.signal(signal.SIGINT, windows_handler)
+				# On Windows, route Ctrl+C to the same pause-first flow as Unix.
+				# Python delivers SIGINT on Windows via signal.signal; we leverage our unified handler.
+				# First Ctrl+C: pause (do NOT exit). Second Ctrl+C: immediate exit via _handle_second_ctrl_c().
+				self.original_sigint_handler = signal.signal(signal.SIGINT, lambda sig, frame: self.sigint_handler())
+				# Best-effort SIGTERM handler (not always sent on Windows but safe to set)
+				try:
+					self.original_sigterm_handler = signal.signal(signal.SIGTERM, lambda sig, frame: self.sigterm_handler())
+				except Exception:
+					# Some Windows environments may not support SIGTERM
+					pass
 			else:
 				# On Unix-like systems, use asyncio's signal handling for smoother experience
 				self.original_sigint_handler = self.loop.add_signal_handler(signal.SIGINT, lambda: self.sigint_handler())
@@ -118,14 +148,41 @@ class SignalHandler:
 			# - some operating systems
 			# - inside jupyter notebooks
 			pass
+		else:
+			# Mark as active and registered
+			_active_signal_handler = self
+			setattr(self, '_is_registered', True)
 
 	def unregister(self) -> None:
 		"""Unregister signal handlers and restore original handlers if possible."""
 		try:
+			global _active_signal_handler
+			if not getattr(self, '_is_registered', False):
+				return
+			# Cancel any pending resume waiter to avoid duplicate prompts from old handlers
+			try:
+				# Instance-level waiter
+				if hasattr(self, '_waiter_task') and self._waiter_task and not self._waiter_task.done():
+					self._waiter_task.cancel()
+					self._waiter_task = None
+				self._resume_waiter_active = False
+				# Global waiter
+				global _global_waiter_task, _global_waiter_active
+				if _global_waiter_task and not _global_waiter_task.done():
+					_global_waiter_task.cancel()
+				_global_waiter_task = None
+				_global_waiter_active = False
+			except Exception:
+				pass
 			if self.is_windows:
-				# On Windows, just restore the original SIGINT handler
+				# On Windows, restore the original SIGINT/SIGTERM handlers if we set them
 				if self.original_sigint_handler:
 					signal.signal(signal.SIGINT, self.original_sigint_handler)
+				if self.original_sigterm_handler:
+					try:
+						signal.signal(signal.SIGTERM, self.original_sigterm_handler)
+					except Exception:
+						pass
 			else:
 				# On Unix-like systems, use asyncio's signal handler removal
 				self.loop.remove_signal_handler(signal.SIGINT)
@@ -138,16 +195,25 @@ class SignalHandler:
 					signal.signal(signal.SIGTERM, self.original_sigterm_handler)
 		except Exception as e:
 			logger.warning(f'Error while unregistering signal handlers: {e}')
+		finally:
+			# Clear active marker
+			setattr(self, '_is_registered', False)
+			if _active_signal_handler is self:
+				_active_signal_handler = None
 
 	def _handle_second_ctrl_c(self) -> None:
 		"""
 		Handle a second Ctrl+C press by performing cleanup and exiting.
 		This is shared logic used by both sigint_handler and wait_for_resume.
 		"""
-		global _exiting
+		global _exiting, _global_pause_active, _global_prompt_printed
 
 		if not _exiting:
 			_exiting = True
+
+			# Clear global flags since we're exiting
+			_global_pause_active = False
+			_global_prompt_printed = False
 
 			# Call custom exit callback if provided
 			if self.custom_exit_callback:
@@ -195,20 +261,35 @@ class SignalHandler:
 		First Ctrl+C: Cancel current step and pause.
 		Second Ctrl+C: Exit immediately if exit_on_second_int is True.
 		"""
-		global _exiting
+		global _exiting, _global_pause_active, _global_prompt_printed
 
 		if _exiting:
 			# Already exiting, force exit immediately
 			os._exit(0)
 
-		if getattr(self.loop, 'ctrl_c_pressed', False):
-			# If we're in the waiting for input state, let the pause method handle it
-			if getattr(self.loop, 'waiting_for_input', False):
-				return
-
-			# Second Ctrl+C - exit immediately if configured to do so
+		# If a global pause is already active, treat this as second Ctrl+C
+		if _global_pause_active:
 			if self.exit_on_second_int:
 				self._handle_second_ctrl_c()
+			return
+
+		# If a prompt is already active (waiting for input), treat this as second Ctrl+C
+		if getattr(self.loop, 'waiting_for_input', False):
+			if self.exit_on_second_int:
+				self._handle_second_ctrl_c()
+			return
+
+		# If we already recorded first Ctrl+C (race protection), treat as second
+		if getattr(self.loop, 'ctrl_c_pressed', False):
+			if self.exit_on_second_int:
+				self._handle_second_ctrl_c()
+			return
+
+		# Mark global pause as active to prevent other handlers from firing
+		_global_pause_active = True
+
+		# This is a fresh pause session; allow prompt to print once
+		_global_prompt_printed = False
 
 		# Mark that Ctrl+C was pressed
 		setattr(self.loop, 'ctrl_c_pressed', True)
@@ -216,15 +297,41 @@ class SignalHandler:
 		# Cancel current tasks that should be interruptible - this is crucial for immediate pausing
 		self._cancel_interruptible_tasks()
 
-		# Call pause callback if provided - this sets the paused flag
-		if self.pause_callback:
+		# Call pause callback once per pause event
+		if self.pause_callback and not getattr(self.loop, 'waiting_for_input', False):
 			try:
 				self.pause_callback()
 			except Exception as e:
 				logger.error(f'Error in pause callback: {e}')
 
 		# Log pause message after pause_callback is called (not before)
-		print('----------------------------------------------------------------------', file=stderr)
+		# Avoid spamming the console with multiple separators; only print once per pause
+		try:
+			now = time.time()
+			if (not _global_prompt_printed) and (self._last_prompt_ts is None or (now - self._last_prompt_ts) > 1.0):
+				print('----------------------------------------------------------------------', file=stderr)
+				self._last_prompt_ts = now
+		except Exception:
+			if not _global_prompt_printed:
+				print('----------------------------------------------------------------------', file=stderr)
+
+		# Start a non-blocking waiter to accept resume or guidance input without freezing the loop
+		try:
+			global _global_waiter_task, _global_waiter_active
+			if not getattr(self, '_resume_waiter_active', False) and not _global_waiter_active:
+				self._resume_waiter_active = True
+				_global_waiter_active = True
+				# Cancel any existing waiter tasks first (instance + global)
+				if hasattr(self, '_waiter_task') and self._waiter_task and not self._waiter_task.done():
+					self._waiter_task.cancel()
+				if _global_waiter_task and not _global_waiter_task.done():
+					_global_waiter_task.cancel()
+				# Create and assign both for safety
+				self._waiter_task = asyncio.create_task(self._async_wait_for_resume())
+				_global_waiter_task = self._waiter_task
+		except Exception:
+			# Never crash the signal path
+			pass
 
 	def sigterm_handler(self) -> None:
 		"""
@@ -291,14 +398,20 @@ class SignalHandler:
 		reset = '\x1b[0m'
 
 		try:  # escape code is to blink the ...
-			print(
-				f'➡️  Press {green}[Enter]{reset} to resume or {red}[Ctrl+C]{reset} again to exit{blink}...{unblink} ',
-				end='',
-				flush=True,
-				file=stderr,
-			)
-			input()  # This will raise KeyboardInterrupt on Ctrl+C
+			# Use the guarded prompt printer to avoid repeated lines
+			self._print_resume_prompt()
+			line = input()  # This will raise KeyboardInterrupt on Ctrl+C
 
+			# If user typed guidance, deliver it first
+			if line and line.strip() and self.guidance_callback:
+				try:
+					res = self.guidance_callback(line.strip())
+					# Support async callbacks
+					if inspect.iscoroutine(res):
+						asyncio.create_task(res)
+				except Exception:
+					# guidance is best-effort
+					pass
 			# Call resume callback if provided
 			if self.resume_callback:
 				self.resume_callback()
@@ -313,8 +426,76 @@ class SignalHandler:
 			except Exception:
 				pass
 
+	def _print_resume_prompt(self) -> None:
+		"""Helper: print the resume/guidance prompt to stderr."""
+		global _global_prompt_printed, _global_prompt_last_ts
+		# Print only once per pause lifecycle
+		if _global_prompt_printed:
+			return
+		# Global throttle: avoid re-print within 2 seconds even if something reset flags
+		now = time.time()
+		if _global_prompt_last_ts is not None and (now - _global_prompt_last_ts) < 2.0:
+			return
+		green = '\x1b[32;1m'
+		red = '\x1b[31m'
+		blink = '\033[33;5m'
+		unblink = '\033[0m'
+		reset = '\x1b[0m'
+		print(
+			f'➡️  Press {green}[Enter]{reset} to resume, type a message then Enter to send guidance, or {red}[Ctrl+C]{reset} again to exit{blink}...{unblink} ',
+			end='\n',
+			flush=True,
+			file=stderr,
+		)
+		_global_prompt_printed = True
+		_global_prompt_last_ts = now
+
+	async def _async_wait_for_resume(self) -> None:
+		"""Non-blocking resume/guidance input using an executor to avoid freezing the loop."""
+		try:
+			setattr(self.loop, 'waiting_for_input', True)
+			# Print prompt
+			self._print_resume_prompt()
+			# Read line from stdin in a thread to avoid blocking the loop
+			line = await self.loop.run_in_executor(None, input)
+			# Deliver guidance if provided
+			if line and line.strip() and self.guidance_callback:
+				try:
+					res = self.guidance_callback(line.strip())
+					if inspect.iscoroutine(res):
+						asyncio.create_task(res)
+				except Exception:
+					pass
+			# Resume
+			if self.resume_callback:
+				self.resume_callback()
+		except KeyboardInterrupt:
+			# Treat as second Ctrl+C
+			self._handle_second_ctrl_c()
+		except Exception:
+			# Swallow any unexpected errors to keep the app running
+			pass
+		finally:
+			try:
+				self.reset()
+				self._resume_waiter_active = False
+				# Clear global waiter markers
+				global _global_waiter_task, _global_waiter_active
+				_global_waiter_task = None
+				_global_waiter_active = False
+				# Clear task reference
+				if hasattr(self, '_waiter_task'):
+					self._waiter_task = None
+			except Exception:
+				pass
+
 	def reset(self) -> None:
 		"""Reset state after resuming."""
+		global _global_pause_active
+
+		# Clear the global pause flag (keep prompt printed flag until next SIGINT)
+		_global_pause_active = False
+
 		# Clear the flags
 		if hasattr(self.loop, 'ctrl_c_pressed'):
 			setattr(self.loop, 'ctrl_c_pressed', False)
@@ -542,7 +723,7 @@ def merge_dicts(a: dict, b: dict, path: tuple[str, ...] = ()):
 			a[key] = b[key]
 	return a
 
-    
+
 @cache
 def get_browser_use_version() -> str:
 	"""Get the browser-use package version using the same logic as Agent._set_browser_use_version_and_source"""
@@ -574,6 +755,49 @@ def get_browser_use_version() -> str:
 		return 'unknown'
 
 
+@cache
+def get_git_info() -> dict[str, str] | None:
+	"""Get git information if installed from git repository"""
+	try:
+		import subprocess
+
+		package_root = Path(__file__).parent.parent
+		git_dir = package_root / '.git'
+		if not git_dir.exists():
+			return None
+
+		# Get git commit hash
+		commit_hash = (
+			subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=package_root, stderr=subprocess.DEVNULL).decode().strip()
+		)
+
+		# Get git branch
+		branch = (
+			subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=package_root, stderr=subprocess.DEVNULL)
+			.decode()
+			.strip()
+		)
+
+		# Get remote URL
+		remote_url = (
+			subprocess.check_output(['git', 'config', '--get', 'remote.origin.url'], cwd=package_root, stderr=subprocess.DEVNULL)
+			.decode()
+			.strip()
+		)
+
+		# Get commit timestamp
+		commit_timestamp = (
+			subprocess.check_output(['git', 'show', '-s', '--format=%ci', 'HEAD'], cwd=package_root, stderr=subprocess.DEVNULL)
+			.decode()
+			.strip()
+		)
+
+		return {'commit_hash': commit_hash, 'branch': branch, 'remote_url': remote_url, 'commit_timestamp': commit_timestamp}
+	except Exception as e:
+		logger.debug(f'Error getting git info: {type(e).__name__}: {e}')
+		return None
+
+
 def _log_pretty_path(path: str | Path | None) -> str:
 	"""Pretty-print a path, shorten home dir to ~ and cwd to ."""
 
@@ -602,6 +826,7 @@ def _log_pretty_url(s: str, max_len: int | None = 22) -> str:
 	if max_len is not None and len(s) > max_len:
 		return s[:max_len] + '…'
 	return s
+
 
 def redact_sensitive_data(text: str, sensitive_data_map: Optional[Dict[str, Any]]) -> str:
     """
@@ -634,7 +859,7 @@ def redact_sensitive_data(text: str, sensitive_data_map: Optional[Dict[str, Any]
         key=len,
         reverse=True
     )
-    
+
     if not sorted_values:
         return text
 
@@ -648,7 +873,7 @@ def redact_sensitive_data(text: str, sensitive_data_map: Optional[Dict[str, Any]
         return "[SENSITIVE_DATA]"
 
     return pattern.sub(replacer, text)
-    
+
 # NEWLY ADDED FUNCTION
 def get_tool_examples() -> str:
     """

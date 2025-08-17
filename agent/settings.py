@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Any, Awaitable, Callable, Dict, Generic, List, Optional, TypeVar, Union
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from pydantic import ValidationError
 
 from browser_use.agent.views import AgentHistoryList
@@ -25,9 +25,11 @@ class AgentSettings(BaseModel):
     use_planner: bool = True
     reflect_on_error: bool = True
     planner_interval: int = 5
+    planner_history_window: int = 5
+    planner_interval_seconds: float = Field(0.0, description="If >0, time-based cadence for planner triggers.")
     max_steps: int = 100
     max_failures: int = 3
-    max_actions_per_step: int = 10
+    max_actions_per_step: int = 7
     use_thinking: bool = True
     flash_mode: bool = False
     planner_llm: Optional[BaseChatModel] = None
@@ -39,6 +41,15 @@ class AgentSettings(BaseModel):
     available_file_paths: list[Union[str, Path]] = Field(default_factory=list)
     images_per_step: int = 1
     max_history_items: int = 40
+    # I/O timeout & retry controls
+    default_action_timeout_seconds: float = Field(60.0, description="Default timeout for browser I/O actions.")
+    action_timeout_overrides: Dict[str, float] = Field(default_factory=dict, description="Per-action-type timeout overrides in seconds. Keys are action class names or logical action types.")
+    site_profile_overrides: Dict[str, float] = Field(default_factory=dict, description="Domain pattern -> timeout seconds overrides (e.g., {'upload.example.com': 180.0}).")
+    max_attempts_per_action: int = Field(2, description="Max retry attempts per actuation batch on timeout/IO failure.")
+    backoff_base_seconds: float = Field(1.0, description="Base backoff seconds for exponential retry.")
+    backoff_jitter_seconds: float = Field(0.3, description="Jitter seconds added to retry backoff.")
+    # Reflection controls
+    reflect_cooldown_seconds: float = Field(0.0, description="Minimum seconds to wait after a reflection before allowing another, unless failures persist or health modes force it.")
     include_attributes: list[str] = Field(default_factory=lambda: ["data-test-id", "data-testid", "aria-label", "placeholder", "title", "alt"])
     include_tool_call_examples: bool = False
     on_run_start: Optional[AgentHookFunc] = None
@@ -50,7 +61,10 @@ class AgentSettings(BaseModel):
     file_system_path: Optional[str] = None
     page: Optional[Page] = None
     max_perception_staleness_seconds: float = 10.0
-    lock_timeout_seconds: float = Field(5.0, description="Timeout in seconds for acquiring the state lock to prevent deadlocks.")
+    lock_timeout_seconds: float = Field(30.0, description="Timeout in seconds for acquiring the state lock to prevent deadlocks.")
+    memory_budget_mb: float = Field(100.0, description="Memory budget in MB for state manager history. When exceeded, old items are pruned.")
+    max_concurrent_io: int = Field(3, description="Maximum number of concurrent I/O operations (browser actions and LLM calls).")
+    max_concurrent_tasks: int = Field(3, description="Maximum number of concurrent tasks to prevent tab-sprawl and maintain focus.")
     check_ui_stability: bool = True
     output_model: Optional[type[BaseModel]] = None
     browser: Optional[Union[Browser, BrowserSession]] = None
@@ -59,11 +73,59 @@ class AgentSettings(BaseModel):
     file_system: Any = None # To be populated by Supervisor
     is_planner_reasoning: bool = Field(False, description="Controls if the planner prompt encourages verbose reasoning.")
     extend_planner_system_message: Optional[str] = Field(None, description="Additional text for the planner's system message.")
+    # Planner vision controls
+    use_vision_for_planner: bool = Field(False, description="Include screenshots in planner prompts.")
+    planner_images_per_step: int = Field(1, description="Number of recent screenshots to include in planner prompts (if available).")
+    planner_vision_detail: str = Field('auto', description="Vision detail level for planner images: 'auto' | 'low' | 'high'.")
+    planner_use_latest_screenshot_only: bool = Field(False, description="When true, include only the most recent screenshot to minimize token usage.")
     calculate_cost: bool = Field(False, description="Whether to calculate and track token costs for LLM calls.")
+    # Scheduler controls
+    scheduler_enabled: bool = Field(True, description="Enable the lightweight scheduler component.")
+    scheduler_interval_seconds: float = Field(2.0, description="Interval seconds for the scheduler heartbeats.")
+    # Assessor controls
+    assessor_enabled: bool = Field(True, description="Enable fused signal assessor.")
+    assessor_interval_seconds: float = Field(1.0, description="Interval seconds for assessor signal updates.")
+    assessor_risk_trigger: float = Field(0.65, description="Risk threshold to trigger reactive planning.")
+    assessor_risk_clear: float = Field(0.45, description="Risk threshold to clear reactive bias.")
+    assessor_confidence_trigger: float = Field(0.35, description="Confidence threshold to trigger reactive planning.")
+    assessor_confidence_clear: float = Field(0.55, description="Confidence threshold to enable proactive planning.")
+    assessor_cooldown_steps: int = Field(2, description="Min steps between assessment-driven planning triggers (legacy; prefer seconds).")
+    assessor_cooldown_seconds: float = Field(2.0, description="Min seconds between assessment-driven planning triggers.")
+    assessor_dwell_seconds: float = Field(0.5, description="Seconds signal must persist beyond threshold before triggering.")
+    # Feature flag for unified step finalization via StateManager
+    enable_unified_finalization: bool = Field(False, description="Use StateManager.decide_and_apply_after_step for step transitions.")
+    # Rollout flags
+    enable_modes: bool = Field(False, description="Enable health-aware modes and Transition Engine overlays.")
+    enable_prompt_deltas: bool = Field(False, description="Enable prompt delta optimizations (currently no-op).")
+    # Bus QoS controls
+    enable_control_work_split: bool = Field(False, description="Split event buses: control vs work for lower latency step finalization.")
 
+    # Long-running mode settings
+    enable_long_running_mode: bool = Field(False, description="Enable long-running operations mode with failure recovery.")
+    long_running_monitoring_interval: float = Field(30.0, description="Interval in seconds for long-running mode health monitoring.")
+    long_running_checkpoint_interval: float = Field(300.0, description="Interval in seconds for automatic state checkpointing.")
+    long_running_checkpoint_dir: Optional[str] = Field(None, description="Directory for storing state checkpoints. Uses temp dir if None.")
+    long_running_max_checkpoints: int = Field(50, description="Maximum number of checkpoints to retain.")
+    long_running_cpu_threshold_warning: float = Field(80.0, description="CPU usage percentage that triggers warning mode.")
+    long_running_cpu_threshold_critical: float = Field(95.0, description="CPU usage percentage that triggers critical mode.")
+    long_running_memory_threshold_warning: float = Field(80.0, description="Memory usage percentage that triggers warning mode.")
+    long_running_memory_threshold_critical: float = Field(95.0, description="Memory usage percentage that triggers critical mode.")
+    long_running_circuit_breaker_failure_threshold: int = Field(5, description="Number of failures before opening circuit breaker.")
+    long_running_circuit_breaker_recovery_timeout: float = Field(60.0, description="Seconds before attempting to close circuit breaker.")
+    long_running_enable_auto_recovery: bool = Field(True, description="Enable automatic recovery from checkpoints on critical failures.")
+    long_running_enable_autonomous_continuation: bool = Field(True, description="Enable autonomous task continuation after failure recovery.")
+    long_running_max_consecutive_failures: int = Field(3, description="Maximum consecutive failures before requiring manual intervention.")
+    long_running_failure_escalation_delay: float = Field(120.0, description="Seconds to wait before escalating repeated failures.")
 
-    class Config:
-        arbitrary_types_allowed = True
+    # Load shedding configuration
+    cpu_shed_threshold: float = Field(98.0, description="CPU% at or above which to enter shedding mode.")
+    cpu_normal_threshold: float = Field(96.0, description="CPU% at or below which to return to normal mode.")
+    shed_policy: Dict[str, Any] = Field(default_factory=dict, description="Policy knobs when shedding: {perception_skip_n:int, cap_images:int, defer_planner:bool}.")
+
+    # Cooperative shutdown
+    shutdown_grace_seconds: float = Field(2.0, description="Grace period for components to wind down on shutdown.")
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def parse_initial_actions(self, action_model: Any) -> list[Any]:
         if not self.initial_actions:

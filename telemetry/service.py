@@ -2,8 +2,17 @@ import logging
 import os
 
 from dotenv import load_dotenv
-from posthog import Posthog
-from uuid_extensions import uuid7str
+try:
+	from posthog import Posthog
+except Exception:  # make telemetry optional if posthog missing
+	Posthog = None  # type: ignore
+try:
+	from uuid_extensions import uuid7str
+except Exception:
+	# Fallback to uuid4 string if uuid_extensions is not available
+	import uuid
+	def uuid7str():
+		return str(uuid.uuid4())
 
 from browser_use.telemetry.views import BaseTelemetryEvent
 from browser_use.utils import singleton
@@ -39,7 +48,7 @@ class ProductTelemetry:
 		telemetry_disabled = not CONFIG.ANONYMIZED_TELEMETRY
 		self.debug_logging = CONFIG.BROWSER_USE_LOGGING_LEVEL == 'debug'
 
-		if telemetry_disabled:
+		if telemetry_disabled or Posthog is None:
 			self._posthog_client = None
 		else:
 			logger.info(

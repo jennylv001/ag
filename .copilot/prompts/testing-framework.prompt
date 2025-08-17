@@ -1,0 +1,8 @@
+---
+mode: agent
+description: "Perform end to end tests with verifying only with Project's log statements. ."
+---
+
+1. Read `.github/copilot-instructions.md` security guidelines.
+2. Do not consider the task complete until you have successfully executed and passed a project-level, end-to-end test that externally validates the code's functionality; internal logging statements are explicitly forbidden as a form of verification.
+3. Logging statements are explicitly forbidden in test files as a form of verification.

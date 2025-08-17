@@ -1,0 +1,64 @@
+{
+  // === GitHub Copilot Agent Behavior ===
+  "github.copilot.chat.reviewSelection.instructions": "Always begin by analyzing the full codebase context relevant to the change. Require a Flow Map per `.github/copilot-instructions.md` showing all functions, classes, modules, and data transformations involved. Reject any fix that is superficial, patch-only, or does not address the root cause system-wide.",
+  "github.copilot.chat.commitMessage.instructions": "Write concise, imperative commit messages (e.g., 'Fix document save crash by refactoring buffer flush logic'). Mention if the commit resolves a root cause. If a Flow Map was generated, note this explicitly. Focus on the purpose and systemic impact, not implementation trivia.",
+  "github.copilot.chat.pullRequestDescription.instructions": "Provide a clear summary of the change, including: (1) The problem and its root cause, (2) The Flow Map showing relevant code interactions, (3) The structured solution plan, (4) The systemic impact of the fix or feature. Reference `.github/copilot-instructions.md` for standards followed.",
+  // === Prompt File Enablement ===
+  "chat.promptFiles": true,
+  // === Editor & Code Standards ===
+  "editor.formatOnSave": true,
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit",
+    "source.organizeImports": "explicit"
+  },
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "files.eol": "\n",
+  // === Language-Specific Linting & Formatting ===
+  "[javascript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[javascriptreact]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[typescript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[typescriptreact]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.black-formatter"
+  },
+  // === Python Type Checking & Linting ===
+  "python.analysis.typeCheckingMode": "strict",
+  "python.analysis.diagnosticMode": "workspace",
+  "python.linting.enabled": true,
+  "python.linting.pylintEnabled": true,
+  "python.linting.mypyEnabled": true,
+  // === Security-Focused Settings ===
+  "security.workspace.trust.untrustedFiles": "prompt",
+  "codeActionsOnSave": {
+    "source.fixAll": true
+  },
+  // === MCP (Model Context Protocol) Configuration ===
+  "mcp.servers": {
+    "sequential-thinking": {
+      "command": "npx",
+      "args": [
+        "@modelcontextprotocol/server-sequential-thinking"
+      ],
+      "env": {},
+      "description": "Sequential thinking server for step-by-step problem solving and reasoning"
+    },
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp"
+      ],
+      "env": {},
+      "description": "Playwright MCP server for browser automation and testing"
+    }
+  }
+}

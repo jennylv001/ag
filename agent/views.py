@@ -21,7 +21,7 @@ from pydantic import (
 from typing_extensions import Literal, TypeVar
 
 from browser_use.agent.message_manager.views import MessageManagerState
-from browser_use.browser.views import BrowserStateHistory
+from browser_use.browser.views import BrowserStateHistory, BrowserStateSummary
 from browser_use.controller.registry.views import ActionModel
 from browser_use.dom.history_tree_processor.service import (
     DOMElementNode,
@@ -57,11 +57,16 @@ class ActionResult(BaseModel):
     extracted_content: Optional[str] = None
     include_extracted_content_only_once: bool = False
     include_in_memory: bool = False
+    action: Optional[ActionModel] = None  # Add the action field
 
     @model_validator(mode='after')
     def validate_success(self):
-        if self.success is True and not self.is_done:
-            raise ValueError("`success=True` can only be set when `is_done=True`.")
+        # If success is not explicitly set but there's an error, mark as failed
+        if self.success is None and self.error is not None:
+            self.success = False
+        # If success is not explicitly set and no error, mark as successful
+        elif self.success is None and self.error is None:
+            self.success = True
         return self
 
 
@@ -77,10 +82,10 @@ class StepMetadata(BaseModel):
 
 
 class AgentBrain(BaseModel):
-    """A compatibility model representing the LLM's thought process."""
+    """Brain snapshot for downstream components using the new schema names."""
     thinking: Optional[str] = None
-    evaluation_previous_goal: str
-    memory: str
+    prior_action_assessment: str
+    task_log: str
     next_goal: str
 
 
@@ -92,18 +97,21 @@ class AgentOutput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra='forbid')
 
     thinking: Optional[str] = None
-    evaluation_previous_goal: str
-    memory: str
+    # New schema fields (preferred)
+    prior_action_assessment: str
+    task_log: str
     next_goal: str
     action: List[ActionModel] = Field(..., min_length=1)
+
+    # No legacy parsing; inputs must provide the new schema keys.
 
     @property
     def current_state(self) -> AgentBrain:
         """For backward compatibility with components expecting a nested 'AgentBrain'."""
         return AgentBrain(
             thinking=self.thinking,
-            evaluation_previous_goal=self.evaluation_previous_goal,
-            memory=self.memory,
+            prior_action_assessment=self.prior_action_assessment,
+            task_log=self.task_log,
             next_goal=self.next_goal,
         )
 
@@ -126,7 +134,7 @@ class AgentOutput(BaseModel):
                 if 'thinking' in schema.get('properties', {}):
                     del schema['properties']['thinking']
                 return schema
-        
+
         return create_model(
             'AgentOutputNoThinking',
             __base__=AgentOutputNoThinking,
@@ -137,7 +145,7 @@ class AgentOutput(BaseModel):
 class AgentHistory(BaseModel):
     """A record of a single, complete step in the agent's run."""
     model_config = ConfigDict(arbitrary_types_allowed=True, protected_namespaces=())
-    
+
     model_output: Optional[AgentOutput]
     result: list[ActionResult]
     state: Optional[BrowserStateHistory]
@@ -163,8 +171,8 @@ class AgentHistory(BaseModel):
         if self.model_output:
             action_dump = [action.model_dump(exclude_none=True) for action in self.model_output.action]
             model_output_dump = {
-                'evaluation_previous_goal': self.model_output.evaluation_previous_goal,
-                'memory': self.model_output.memory,
+                'prior_action_assessment': self.model_output.prior_action_assessment,
+                'task_log': self.model_output.task_log,
                 'next_goal': self.model_output.next_goal,
                 'action': action_dump,  # This preserves the actual action data
             }
@@ -175,7 +183,7 @@ class AgentHistory(BaseModel):
         return {
             'model_output': model_output_dump,
             'result': [r.model_dump(exclude_none=True) for r in self.result],
-            'state': self.state.to_dict(),
+            'state': self.state.model_dump(mode='json') if self.state else None,
             'metadata': self.metadata.model_dump() if self.metadata else None,
         }
 
@@ -188,7 +196,7 @@ class ReflectionPlannerOutput(BaseModel):
     memory_summary: str
     next_goal: str
     effective_strategy: Optional[str] = None
-    
+
 class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
     """List of AgentHistory messages, i.e. the history of the agent's actions and thoughts."""
 
@@ -235,11 +243,11 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
         """Loads agent history from a JSON file."""
         with Path(filepath).open('r', encoding='utf-8') as f:
             data = json.load(f)
-        
+
         for h_data in data.get('history', []):
             if h_data.get('model_output'):
                 h_data['model_output'] = output_model.model_validate(h_data['model_output'])
-        
+
         return cls.model_validate(data)
 
     # def save_as_playwright_script(
@@ -433,3 +441,9 @@ class AgentError:
         if include_trace:
             return f'{str(error)}\nStacktrace:\n{traceback.format_exc()}'
         return f'{str(error)}'
+
+
+class PerceptionOutput(BaseModel):
+    """Output from the perception module containing browser state and file information."""
+    browser_state: BrowserStateSummary
+    new_downloaded_files: Optional[list[str]] = None

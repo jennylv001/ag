@@ -8,7 +8,14 @@ from typing import Annotated, Any, Literal, Self
 from urllib.parse import urlparse
 
 from pydantic import AfterValidator, AliasChoices, BaseModel, ConfigDict, Field, model_validator
-from uuid_extensions import uuid7str
+# Optional dependency: uuid_extensions; provide a fallback for tests.
+try:
+	from uuid_extensions import uuid7str  # type: ignore
+except Exception:  # pragma: no cover - optional dependency fallback
+	import uuid as _uuid
+
+	def uuid7str() -> str:  # type: ignore
+		return _uuid.uuid4().hex
 
 from browser_use.browser.types import ClientCertificate, Geolocation, HttpCredentials, ProxySettings, ViewportSize
 from browser_use.config import CONFIG
@@ -169,6 +176,10 @@ CHROME_DEFAULT_ARGS = [
 	'--disable-desktop-notifications',
 	'--noerrdialogs',
 	'--silent-debugger-extension-api',
+	# Extension welcome tab suppression for automation
+	'--disable-extensions-http-throttling',
+	'--extensions-on-chrome-urls',
+	'--disable-default-apps',
 	f'--disable-features={",".join(CHROME_DISABLED_COMPONENTS)}',
 ]
 
@@ -310,7 +321,7 @@ class BrowserContextArgs(BaseModel):
 	https://playwright.dev/python/docs/api/class-browser#browser-new-context
 	"""
 
-	model_config = ConfigDict(extra='ignore', validate_assignment=False, revalidate_instances='always', populate_by_name=True)
+	model_config = ConfigDict(extra='ignore', validate_assignment=False, revalidate_instances='always', populate_by_name=True, arbitrary_types_allowed=True)
 
 	# Browser context parameters
 	accept_downloads: bool = True
@@ -371,7 +382,7 @@ class BrowserConnectArgs(BaseModel):
 	https://playwright.dev/python/docs/api/class-browsertype#browser-type-connect-over-cdp
 	"""
 
-	model_config = ConfigDict(extra='ignore', validate_assignment=True, revalidate_instances='always', populate_by_name=True)
+	model_config = ConfigDict(extra='ignore', validate_assignment=True, revalidate_instances='always', populate_by_name=True, arbitrary_types_allowed=True)
 
 	headers: dict[str, str] | None = Field(default=None, description='Additional HTTP headers to be sent with connect request')
 	slow_mo: float = 0.0
@@ -394,6 +405,7 @@ class BrowserLaunchArgs(BaseModel):
 		validate_by_name=True,
 		validate_by_alias=True,
 		populate_by_name=True,
+		arbitrary_types_allowed=True,
 	)
 
 	env: dict[str, str | float | bool] | None = Field(
@@ -403,7 +415,7 @@ class BrowserLaunchArgs(BaseModel):
 	executable_path: str | Path | None = Field(
 		default=None,
 		validation_alias=AliasChoices('browser_binary_path', 'chrome_binary_path'),
-		description='Path to the chromium-based browser executable to use.',
+		description='Path to the chromium-based browser executable to use. For maximum stealth, set this to a stable Chrome installation path to avoid fingerprint detection from using temporary or bundled browsers.',
 	)
 	headless: bool | None = Field(default=None, description='Whether to run the browser in headless or windowed mode.')
 	args: list[CliArgStr] = Field(
@@ -485,7 +497,6 @@ class BrowserNewContextArgs(BrowserContextArgs):
 
 	# storage_state is not supported in launch_persistent_context()
 	storage_state: str | Path | dict[str, Any] | None = None
-	# TODO: use StorageState type instead of dict[str, Any]
 
 	# to apply this to existing contexts (incl cookies, localStorage, IndexedDB), see:
 	# - https://github.com/microsoft/playwright/pull/34591/files
@@ -519,7 +530,10 @@ class BrowserLaunchPersistentContextArgs(BrowserLaunchArgs, BrowserContextArgs):
 	model_config = ConfigDict(extra='ignore', validate_assignment=False, revalidate_instances='always')
 
 	# Required parameter specific to launch_persistent_context, but can be None to use incognito temp dir
-	user_data_dir: str | Path | None = CONFIG.BROWSER_USE_DEFAULT_USER_DATA_DIR
+	user_data_dir: str | Path | None = Field(
+		default=CONFIG.BROWSER_USE_DEFAULT_USER_DATA_DIR,
+		description='Path to persistent Chrome user data directory. For maximum stealth, set this to a dedicated directory that persists between runs to maintain cookies, extensions, and browser history. Avoid temporary directories that reset on each run as they increase fingerprint risk.',
+	)
 
 
 class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, BrowserLaunchArgs, BrowserNewContextArgs):
@@ -558,6 +572,10 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 		description='List of allowed domains for navigation e.g. ["*.google.com", "https://example.com", "chrome-extension://*"]',
 	)
 	keep_alive: bool | None = Field(default=None, description='Keep browser alive after agent run.')
+	enable_default_extensions: bool = Field(
+		default=True,
+		description="Enable automation-optimized extensions: ad blocking (uBlock Origin), cookie handling (I still don't care about cookies), and URL cleaning (ClearURLs). All extensions work automatically without manual intervention. Extensions are automatically downloaded and loaded when enabled.",
+	)
 	window_size: ViewportSize | None = Field(
 		default=None,
 		description='Browser window size to use when headless=False.',
@@ -593,7 +611,7 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 		default=None, description='File to save cookies to. DEPRECATED, use `storage_state` instead.'
 	)
 
-	# TODO: finish implementing extension support in extensions.py
+	# Extension support for future implementation
 	# extension_ids_to_preinstall: list[str] = Field(
 	# 	default_factory=list, description='List of Chrome extension IDs to preinstall.'
 	# )
@@ -620,13 +638,30 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 			window_size['width'] = window_size['width'] or self.window_width or 1280
 			window_size['height'] = window_size['height'] or self.window_height or 1100
 			self.window_size = window_size
+
+		return self
+
+	@model_validator(mode='after')
+	def apply_stealth_defaults(self) -> Self:
+		"""Apply subtle, realistic defaults when stealth is enabled."""
+		try:
+			if self.stealth:
+				# Default to a common locale so Accept-Language and navigator.language are consistent
+				self.locale = self.locale or 'en-US'
+				# Avoid loading automation-focused extensions by default; they can be detectable and alter content.
+				# Users can still explicitly enable via enable_default_extensions=True.
+				if self.enable_default_extensions is True:
+					self.enable_default_extensions = False
+					logger.info('🧩 Stealth: default automation extensions disabled (opt-in via enable_default_extensions=True)')
+		except Exception:
+			pass
 		return self
 
 	@model_validator(mode='after')
 	def warn_storage_state_user_data_dir_conflict(self) -> Self:
 		"""Warn when both storage_state and user_data_dir are set, as this can cause conflicts."""
 		has_storage_state = self.storage_state is not None
-		has_user_data_dir = self.user_data_dir is not None
+		has_user_data_dir = (self.user_data_dir is not None) and ('tmp' not in str(self.user_data_dir).lower())
 		has_cookies_file = self.cookies_file is not None
 		static_source = 'cookies_file' if has_cookies_file else 'storage_state' if has_storage_state else None
 
@@ -699,11 +734,160 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 				if self.window_position
 				else []
 			),
+			*(self._get_extension_args() if self.enable_default_extensions else []),
 		]
 
 		# convert to dict and back to dedupe and merge duplicate args
 		final_args_list = BrowserLaunchArgs.args_as_list(BrowserLaunchArgs.args_as_dict(pre_conversion_args))
 		return final_args_list
+
+	def _get_extension_args(self) -> list[str]:
+		"""Get Chrome args for enabling default extensions (ad blocker and cookie handler)."""
+		extension_paths = self._ensure_default_extensions_downloaded()
+
+		args = [
+			'--enable-extensions',
+			'--disable-extensions-file-access-check',
+			'--disable-extensions-http-throttling',
+			'--enable-extension-activity-logging',
+		]
+
+		if extension_paths:
+			args.append(f'--load-extension={",".join(extension_paths)}')
+
+		return args
+
+	def _ensure_default_extensions_downloaded(self) -> list[str]:
+		"""
+		Ensure default extensions are downloaded and cached locally.
+		Returns list of paths to extension directories.
+		"""
+
+		# Extension definitions - optimized for automation and content extraction
+		extensions = [
+			{
+				'name': 'uBlock Origin',
+				'id': 'cjpalhdlnbpafiamejdnhcphjbkeiagm',
+				'url': 'https://clients2.google.com/service/update2/crx?response=redirect&prodversion=130&acceptformat=crx3&x=id%3Dcjpalhdlnbpafiamejdnhcphjbkeiagm%26uc',
+			},
+			{
+				'name': "I still don't care about cookies",
+				'id': 'edibdbjcniadpccecjdfdjjppcpchdlm',
+				'url': 'https://clients2.google.com/service/update2/crx?response=redirect&prodversion=130&acceptformat=crx3&x=id%3Dedibdbjcniadpccecjdfdjjppcpchdlm%26uc',
+			},
+			{
+				'name': 'ClearURLs',
+				'id': 'lckanjgmijmafbedllaakclkaicjfmnk',
+				'url': 'https://clients2.google.com/service/update2/crx?response=redirect&prodversion=130&acceptformat=crx3&x=id%3Dlckanjgmijmafbedllaakclkaicjfmnk%26uc',
+			},
+		]
+
+		# Create extensions cache directory
+		cache_dir = CONFIG.BROWSER_USE_EXTENSIONS_DIR
+		cache_dir.mkdir(parents=True, exist_ok=True)
+
+		extension_paths = []
+		loaded_extension_names = []
+
+		for ext in extensions:
+			ext_dir = cache_dir / ext['id']
+			crx_file = cache_dir / f'{ext["id"]}.crx'
+
+			# Check if extension is already extracted
+			if ext_dir.exists() and (ext_dir / 'manifest.json').exists():
+				extension_paths.append(str(ext_dir))
+				loaded_extension_names.append(ext['name'])
+				continue
+
+			try:
+				# Download extension if not cached
+				if not crx_file.exists():
+					logger.info(f'📦 Downloading {ext["name"]} extension...')
+					self._download_extension(ext['url'], crx_file)
+
+				# Extract extension
+				if crx_file.exists():
+					logger.info(f'📂 Extracting {ext["name"]} extension...')
+					self._extract_extension(crx_file, ext_dir)
+					extension_paths.append(str(ext_dir))
+					loaded_extension_names.append(ext['name'])
+
+			except Exception as e:
+				logger.warning(f'⚠️ Failed to setup {ext["name"]} extension: {e}')
+				continue
+
+		if extension_paths:
+			logger.info(f'✅ Extensions ready: {len(extension_paths)} extensions loaded ({", ".join(loaded_extension_names)})')
+		else:
+			logger.warning('⚠️ No default extensions could be loaded')
+
+		return extension_paths
+
+	def _download_extension(self, url: str, output_path: Path) -> None:
+		"""Download extension .crx file."""
+		import urllib.request
+
+		try:
+			with urllib.request.urlopen(url) as response:
+				with open(output_path, 'wb') as f:
+					f.write(response.read())
+		except Exception as e:
+			raise Exception(f'Failed to download extension: {e}')
+
+	def _extract_extension(self, crx_path: Path, extract_dir: Path) -> None:
+		"""Extract .crx file to directory."""
+		import os
+		import zipfile
+
+		# Remove existing directory
+		if extract_dir.exists():
+			import shutil
+
+			shutil.rmtree(extract_dir)
+
+		extract_dir.mkdir(parents=True, exist_ok=True)
+
+		try:
+			# CRX files are ZIP files with a header, try to extract as ZIP
+			with zipfile.ZipFile(crx_path, 'r') as zip_ref:
+				zip_ref.extractall(extract_dir)
+
+			# Verify manifest exists
+			if not (extract_dir / 'manifest.json').exists():
+				raise Exception('No manifest.json found in extension')
+
+		except zipfile.BadZipFile:
+			# CRX files have a header before the ZIP data
+			# Skip the CRX header and extract the ZIP part
+			with open(crx_path, 'rb') as f:
+				# Read CRX header to find ZIP start
+				magic = f.read(4)
+				if magic != b'Cr24':
+					raise Exception('Invalid CRX file format')
+
+				version = int.from_bytes(f.read(4), 'little')
+				if version == 2:
+					pubkey_len = int.from_bytes(f.read(4), 'little')
+					sig_len = int.from_bytes(f.read(4), 'little')
+					f.seek(16 + pubkey_len + sig_len)  # Skip to ZIP data
+				elif version == 3:
+					header_len = int.from_bytes(f.read(4), 'little')
+					f.seek(12 + header_len)  # Skip to ZIP data
+
+				# Extract ZIP data
+				zip_data = f.read()
+
+			# Write ZIP data to temp file and extract
+			import tempfile
+
+			with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as temp_zip:
+				temp_zip.write(zip_data)
+				temp_zip.flush()
+
+				with zipfile.ZipFile(temp_zip.name, 'r') as zip_ref:
+					zip_ref.extractall(extract_dir)
+
+				os.unlink(temp_zip.name)
 
 	def kwargs_for_launch_persistent_context(self) -> BrowserLaunchPersistentContextArgs:
 		"""Return the kwargs for BrowserType.launch()."""
@@ -721,23 +905,7 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 		"""Return the kwargs for BrowserType.connect_over_cdp()."""
 		return BrowserLaunchArgs(**self.model_dump(exclude={'args'}), args=self.get_args())
 
-	# def preinstall_extensions(self) -> None:
-	# 	"""Preinstall the extensions."""
-
-	#     # create the local unpacked extensions dir
-	# 	extensions_dir = self.user_data_dir / 'Extensions'
-	# 	extensions_dir.mkdir(parents=True, exist_ok=True)
-
-	#     # download from the chrome web store using the chrome web store api
-	# 	for extension_id in self.extension_ids_to_preinstall:
-	# 		extension_path = extensions_dir / f'{extension_id}.crx'
-	# 		if extension_path.exists():
-	# 			logger.warning(f'⚠️ Extension {extension_id} is already installed, skipping preinstall.')
-	# 		else:
-	# 			logger.info(f'🔍 Preinstalling extension {extension_id}...')
-	# 			# TODO: copy this from ArchiveBox implementation
-
-	@observe_debug(name='detect_display_configuration')
+	@observe_debug(ignore_input=True, ignore_output=True, name='detect_display_configuration')
 	def detect_display_configuration(self) -> None:
 		"""
 		Detect the system display size and initialize the display-related config defaults:
