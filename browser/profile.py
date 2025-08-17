@@ -715,6 +715,18 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 		elif not self.ignore_default_args:
 			default_args = CHROME_DEFAULT_ARGS
 
+		# Ensure default_args is a list for downstream filtering
+		if isinstance(default_args, set):
+			default_args = list(default_args)
+
+		# In headful mode, allow the browser window to activate/focus (more visible UX)
+		# Drop the deactivation flag only when headless=False
+		try:
+			if self.headless is False:
+				default_args = [a for a in default_args if a != '--disable-window-activation']
+		except Exception:
+			pass
+
 		# Capture args before conversion for logging
 		pre_conversion_args = [
 			*default_args,

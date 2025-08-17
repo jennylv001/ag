@@ -84,9 +84,9 @@ class Supervisor:
         self._setup_browser_session()
 
         # QoS buses: optionally split control vs work
-        self.agent_bus = asyncio.Queue(maxsize=1000)
+        self.agent_bus = asyncio.Queue(maxsize=10000)  # Increased to 10k for 8+ concurrent components
         self.control_bus = (
-            asyncio.Queue(maxsize=1000)
+            asyncio.Queue(maxsize=10000)  # Increased to match agent_bus capacity
             if getattr(self.settings, 'enable_control_work_split', False)
             else self.agent_bus
         )
@@ -103,7 +103,7 @@ class Supervisor:
         set_global_io_semaphore(self.settings.max_concurrent_io)
 
         # Create separate heartbeat queue for ReactorVitals to avoid event competition
-        self.heartbeat_bus = asyncio.Queue(maxsize=1000)
+        self.heartbeat_bus = asyncio.Queue(maxsize=5000)  # Increased to match other queues for 8+ components
 
         # Wire up components
         self.perception = Perception(
@@ -196,14 +196,20 @@ class Supervisor:
             pass
 
     async def run(self) -> AgentHistoryList:
-        signal_handler = SignalHandler(
-            loop=asyncio.get_event_loop(),
-            pause_callback=self.pause,
-            resume_callback=self.resume,
-            custom_exit_callback=self.stop,
-            guidance_callback=lambda text: asyncio.create_task(self.state_manager.add_human_guidance(text))
-        )
-        signal_handler.register()
+        # Register interactive controls only when explicitly enabled
+        signal_handler = None
+        try:
+            if bool(getattr(self.settings, 'enable_interactive_controls', False)):
+                signal_handler = SignalHandler(
+                    loop=asyncio.get_event_loop(),
+                    pause_callback=self.pause,
+                    resume_callback=self.resume,
+                    custom_exit_callback=self.stop,
+                    guidance_callback=lambda text: asyncio.create_task(self.state_manager.add_human_guidance(text))
+                )
+                signal_handler.register()
+        except Exception:
+            signal_handler = None
 
         try:
             if self.settings.on_run_start: await self.settings.on_run_start(self)
@@ -290,6 +296,13 @@ class Supervisor:
 
                         # Publish only an initial StepFinalized to let Perception emit the snapshot.
                         # This avoids duplicate PerceptionSnapshots and reduces queue pressure.
+                        
+                        # CRITICAL FIX: Set step_barrier before publishing initial StepFinalized
+                        # This ensures Perception won't deadlock waiting for the barrier on step_token=0
+                        if hasattr(self, 'step_barrier') and self.step_barrier:
+                            self.step_barrier.set()
+                            logger.debug("Step barrier set for initial StepFinalized event")
+                        
                         try:
                             (self.control_bus if self.control_bus is not self.work_bus else self.work_bus).put_nowait(StepFinalized(step_token=0))
                             agent_log(logging.INFO, self.state_manager.state.agent_id, 0,
@@ -306,26 +319,22 @@ class Supervisor:
 
                         # Start long-running mode monitoring if enabled
                         if self.long_running_integration.enabled:
-                            await self.long_running_integration.start_monitoring()
-                except* Exception as eg:
-                    await self.state_manager.set_status(AgentStatus.FAILED, force=True)
-                    for e in eg.exceptions:
-                        # Create emergency checkpoint if long-running mode is enabled
-                        if hasattr(self, 'long_running_integration') and self.long_running_integration.enabled:
-                            try:
-                                await self.long_running_integration.create_emergency_checkpoint(
-                                    f"TaskGroup exception: {type(e).__name__}"
-                                )
-                            except Exception as checkpoint_error:
-                                agent_log(logging.ERROR, self.state_manager.state.agent_id,
-                                         self.state_manager.state.n_steps,
-                                         f"Failed to create emergency checkpoint: {checkpoint_error}")
+                            lr_signal_handler = SignalHandler(
+                                loop=asyncio.get_event_loop(),
+                                pause_callback=self.pause,
+                                resume_callback=self.resume,
+                                custom_exit_callback=self.stop,
+                                guidance_callback=lambda text: asyncio.create_task(self.state_manager.add_human_guidance(text))
+                            )
+                            lr_signal_handler.register()
 
-                        await self._record_error_in_history(e)
+                except Exception as e:
+                    await self._record_error_in_history(e)
         except AgentInterruptedError:
             await self.state_manager.set_status(AgentStatus.STOPPED)
         finally:
-            signal_handler.unregister()
+            if signal_handler:
+                signal_handler.unregister()
             self._log_final_status()
             if self.settings.on_run_end: await self.settings.on_run_end(self.state_manager.state.history)
             await self.close()
@@ -436,8 +445,6 @@ class Supervisor:
                     finally:
                         (self.control_bus if self.control_bus is not self.work_bus else self.work_bus).task_done()
                         await asyncio.sleep(0)  # Brief backoff on queue pressure
-                    continue
-
             except asyncio.TimeoutError:
                 # Check for potential deadlock
                 time_since_last_event = time.time() - self._last_event_time
@@ -520,7 +527,6 @@ class Supervisor:
                 )
 
             await self._finalize_step(actuation_result)
-            self.step_barrier.set()  # Signal that step is complete
 
             if self.settings.on_step_end:
                 await self.settings.on_step_end(self)
@@ -640,6 +646,12 @@ class Supervisor:
         try:
             browser_state = await self.perception._get_browser_state_with_recovery()
             logger.info(f"Got fresh browser state: URL={browser_state.url}")
+            
+            # CRITICAL FIX: Set step_barrier BEFORE publishing PerceptionSnapshot to prevent deadlock
+            if hasattr(self, 'step_barrier') and self.step_barrier:
+                self.step_barrier.set()
+                logger.debug("Step barrier set - Perception can now proceed")
+            
             perception_snapshot = PerceptionSnapshot(
                 step_token=self.state_manager.state.n_steps,
                 browser_state=browser_state,
@@ -717,7 +729,8 @@ class Supervisor:
                 continue
 
             try:
-                cpu = psutil.cpu_percent(interval=1.0)
+                # Non-blocking CPU sampling: offload psutil call without sleeping the event loop
+                cpu = await asyncio.to_thread(psutil.cpu_percent, None)
                 # Use configurable thresholds when available
                 shed_thr = float(getattr(self.settings, 'cpu_shed_threshold', CPU_SHEDDING_THRESHOLD))
                 normal_thr = float(getattr(self.settings, 'cpu_normal_threshold', CPU_NORMAL_THRESHOLD))
@@ -726,6 +739,8 @@ class Supervisor:
                     await self.state_manager.set_load_status(LoadStatus.SHEDDING)
                 elif cpu <= normal_thr and load_status != LoadStatus.NORMAL:
                     await self.state_manager.set_load_status(LoadStatus.NORMAL)
+                # Cadence for next sample; keep it light
+                await asyncio.sleep(1.0)
             except Exception:
                 # Never fail the monitor; back off
                 await asyncio.sleep(5.0)
