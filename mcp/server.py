@@ -587,7 +587,15 @@ class BrowserUseServer:
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
-		if new_tab:
+		# Avoid creating an extra tab if the only current tab is a new-tab/about:blank
+		current_is_blank = False
+		try:
+			current_page = await self.browser_session.get_current_page()
+			current_is_blank = bool(current_page and (current_page.url == 'about:blank' or current_page.url.startswith('chrome://new-tab-page')))
+		except Exception:
+			pass
+
+		if new_tab and not current_is_blank:
 			page = await self.browser_session.create_new_tab(url)
 			tab_idx = self.browser_session.tabs.index(page)
 			return f'Opened new tab #{tab_idx} with URL: {url}'

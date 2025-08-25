@@ -93,7 +93,7 @@
 
   const ID = { current: 0 };
 
-  const HIGHLIGHT_CONTAINER_ID = "content-interaction-overlay";
+  const HIGHLIGHT_CONTAINER_ID = "playwright-highlight-container";
 
   // Add a WeakMap cache for XPath strings
   const xpathCache = new WeakMap();
@@ -140,8 +140,8 @@
         container.style.left = "0";
         container.style.width = "100%";
         container.style.height = "100%";
-        // Use a high but reasonable z-index for overlay positioning
-        container.style.zIndex = "999999";
+        // Use the maximum valid value in zIndex to ensure the element is not blocked by overlapping elements.
+        container.style.zIndex = "2147483647";
         container.style.backgroundColor = 'transparent';
         document.body.appendChild(container);
       }
@@ -207,7 +207,7 @@
       // Create and position a single label relative to the first rect
       const firstRect = rects[0];
       label = document.createElement("div");
-      label.className = "interaction-focus-label";
+      label.className = "playwright-highlight-label";
       label.style.position = "fixed";
       label.style.background = baseColor;
       label.style.color = "white";
@@ -530,21 +530,21 @@
    */
   function isElementVisible(element) {
     const style = getCachedComputedStyle(element);
-    return (
-      element.offsetWidth > 0 &&
-      element.offsetHeight > 0 &&
-      style?.visibility !== "hidden" &&
-      style?.display !== "none"
-    );
+    if (!style || style.visibility === 'hidden' || style.display === 'none' || parseFloat(style.opacity) === 0) {
+      return false;
+    }
+    // Fast path geometry check
+    if (element.offsetWidth <= 0 && element.offsetHeight <= 0) return false;
+    return true;
   }
 
   /**
    * Checks if an element is interactive.
-   *
+   * 
    * lots of comments, and uncommented code - to show the logic of what we already tried
-   *
+   * 
    * One of the things we tried at the beginning was also to use event listeners, and other fancy class, style stuff -> what actually worked best was just combining most things with computed cursor style :)
-   *
+   * 
    * @param {HTMLElement} element - The element to check.
    */
   function isInteractiveElement(element) {
@@ -555,6 +555,14 @@
     // Cache the tagName and style lookups
     const tagName = element.tagName.toLowerCase();
     const style = getCachedComputedStyle(element);
+
+    // Consider iframe as an interactive boundary so clicking its box forwards
+    // the event into the embedded document (e.g., CAPTCHA widgets).
+    if (tagName === 'iframe') {
+      return true;
+    }
+
+  // Keep ancestor pointer-events scan disabled by default for speed
 
     // Define interactive cursors
     const interactiveCursors = new Set([
@@ -599,7 +607,7 @@
       'inherit'      // Inherited value
       //? Let's just include all potentially clickable elements that are not specifically blocked
       // 'none',        // No cursor
-      // 'default',     // Default cursor
+      // 'default',     // Default cursor 
       // 'auto',        // Browser default
     ]);
 
@@ -851,12 +859,7 @@
     // For elements in viewport, check if they're topmost. Do the check in the
     // center of the element and at the corners to ensure we catch more cases.
     const checkPoints = [
-      // Initially only this was used, but it was not enough
-      { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
-      { x: rect.left + margin, y: rect.top + margin },        // top left
-      // { x: rect.right - margin, y: rect.top + margin },    // top right
-      // { x: rect.left + margin, y: rect.bottom - margin },  // bottom left
-      { x: rect.right - margin, y: rect.bottom - margin },    // bottom right
+      { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
     ];
 
     return checkPoints.some(({ x, y }) => {
@@ -920,6 +923,41 @@
     }
 
     return false; // No rects were found in the viewport
+  }
+
+  // Compute element coordinates in viewport and page space
+  function getElementCoordinates(element) {
+    const rect = getCachedBoundingRect(element);
+    if (!rect || (rect.width === 0 && rect.height === 0)) return null;
+
+    const viewportCoordinates = {
+      topLeft: { x: rect.left, y: rect.top },
+      topRight: { x: rect.right, y: rect.top },
+      bottomLeft: { x: rect.left, y: rect.bottom },
+      bottomRight: { x: rect.right, y: rect.bottom },
+      center: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
+      width: rect.width,
+      height: rect.height,
+    };
+
+    const pageCoordinates = {
+      topLeft: { x: rect.left + window.scrollX, y: rect.top + window.scrollY },
+      topRight: { x: rect.right + window.scrollX, y: rect.top + window.scrollY },
+      bottomLeft: { x: rect.left + window.scrollX, y: rect.bottom + window.scrollY },
+      bottomRight: { x: rect.right + window.scrollX, y: rect.bottom + window.scrollY },
+      center: { x: rect.left + rect.width / 2 + window.scrollX, y: rect.top + rect.height / 2 + window.scrollY },
+      width: rect.width,
+      height: rect.height,
+    };
+
+    const viewportInfo = {
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+      width: window.innerWidth,
+      height: window.innerHeight,
+    };
+
+    return { viewportCoordinates, pageCoordinates, viewportInfo };
   }
 
   // /**
@@ -1297,11 +1335,15 @@
     };
 
     // Get attributes for interactive elements or potential text containers
-    if (isInteractiveCandidate(node) || node.tagName.toLowerCase() === 'iframe' || node.tagName.toLowerCase() === 'body') {
+  if (isInteractiveCandidate(node) || node.tagName.toLowerCase() === 'iframe' || node.tagName.toLowerCase() === 'body') {
       const attributeNames = node.getAttributeNames?.() || [];
       for (const name of attributeNames) {
         const value = node.getAttribute(name);
-        nodeData.attributes[name] = value;
+        // Reduce noise for LLM consumption (optional stricter rules when enabled)
+        if (name === 'style') continue;
+    // Skip class on non-interactive candidates to reduce noise
+    if (name === 'class' && !isInteractiveCandidate(node)) continue;
+    nodeData.attributes[name] = value;
       }
     }
 
@@ -1311,15 +1353,25 @@
       nodeData.isVisible = isElementVisible(node); // isElementVisible uses offsetWidth/Height, which is fine
       if (nodeData.isVisible) {
         nodeData.isTopElement = isTopElement(node);
-
+        
         // Special handling for ARIA menu containers - check interactivity even if not top element
         const role = node.getAttribute('role');
         const isMenuContainer = role === 'menu' || role === 'menubar' || role === 'listbox';
-
+        
         if (nodeData.isTopElement || isMenuContainer) {
           nodeData.isInteractive = isInteractiveElement(node);
           // Call the dedicated highlighting function
           nodeWasHighlighted = handleHighlighting(nodeData, node, parentIframe, isParentHighlighted);
+
+          // Attach coordinates only for elements that receive a highlight index
+          if (nodeData.highlightIndex !== undefined) {
+            const coords = getElementCoordinates(node);
+            if (coords) {
+              nodeData.viewportCoordinates = coords.viewportCoordinates;
+              nodeData.pageCoordinates = coords.pageCoordinates;
+              nodeData.viewportInfo = coords.viewportInfo;
+            }
+          }
         }
       }
     }

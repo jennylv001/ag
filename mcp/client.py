@@ -83,11 +83,13 @@ class MCPClient:
 			logger.debug(f'Already connected to {self.server_name}')
 			return
 
-		start_time = time.time()
+			start_time = time.monotonic()
 		error_msg = None
 
 		try:
-			logger.info(f"🔌 Connecting to MCP server '{self.server_name}': {self.command} {' '.join(self.args)}")
+			# Avoid logging full raw args to reduce verbosity/sensitive exposure
+			args_preview = f"{len(self.args)} arg(s)" if isinstance(self.args, list) else 'args'
+			logger.info(f"🔌 Connecting to MCP server '{self.server_name}': {self.command} ({args_preview})")
 
 			# Create server parameters
 			server_params = StdioServerParameters(command=self.command, args=self.args, env=self.env)
@@ -113,7 +115,7 @@ class MCPClient:
 			raise
 		finally:
 			# Capture telemetry for connect action
-			duration = time.time() - start_time
+			duration = time.monotonic() - start_time
 			self._telemetry.capture(
 				MCPClientTelemetryEvent(
 					server_name=self.server_name,
@@ -163,7 +165,7 @@ class MCPClient:
 		if not self._connected:
 			return
 
-		start_time = time.time()
+		start_time = time.monotonic()
 		error_msg = None
 
 		try:
@@ -193,7 +195,7 @@ class MCPClient:
 			logger.error(f'Error disconnecting from MCP server: {e}')
 		finally:
 			# Capture telemetry for disconnect action
-			duration = time.time() - start_time
+			duration = time.monotonic() - start_time
 			self._telemetry.capture(
 				MCPClientTelemetryEvent(
 					server_name=self.server_name,
@@ -317,7 +319,7 @@ class MCPClient:
 
 				logger.debug(f"🔧 Calling MCP tool '{tool.name}' with params: {tool_params}")
 
-				start_time = time.time()
+				start_time = time.monotonic()
 				error_msg = None
 
 				try:
@@ -338,7 +340,7 @@ class MCPClient:
 					return ActionResult(error=error_msg, success=False)
 				finally:
 					# Capture telemetry for tool call
-					duration = time.time() - start_time
+					duration = time.monotonic() - start_time
 					self._telemetry.capture(
 						MCPClientTelemetryEvent(
 							server_name=self.server_name,

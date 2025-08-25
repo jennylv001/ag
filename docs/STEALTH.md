@@ -14,6 +14,7 @@ from browser_use import Agent, AgentSettings, BrowserProfile
 # Configure stealth mode
 browser_profile = BrowserProfile(
     stealth=True,                           # Enable stealth mode
+    advanced_stealth=True,                  # Apply sensible behavioral defaults (optional)
     executable_path="/path/to/chrome",      # Point to Chrome executable
     user_data_dir="/path/to/stealth/profile",  # Dedicated profile directory
     headless=False,                         # Use headed mode for better stealth
@@ -129,17 +130,17 @@ for step in agent.history.history:
    executable_path = "/path/to/google-chrome"  # Not chromium
    ```
 
-### Environment Variables
+### Configuration model (flags only)
 
-Control stealth behavior with environment variables:
+Stealth is governed by just two profile flags:
+
+- stealth=True: enables core human-like interactions (typing, scrolling) and stealth launch hygiene.
+- advanced_stealth=True: when paired with stealth, enables behavioral features (entropy, planning, exploration, error simulation, navigation).
+
+No per-feature environment variables are required anymore. For deterministic runs you may still set:
 
 ```bash
-# Enable/disable stealth navigation delays (default: true)
-export STEALTH_NAVSCROLL=true
-
-# Control stealth timing parameters
-export STEALTH_MIN_DELAY=50    # Minimum typing delay (ms)
-export STEALTH_MAX_DELAY=150   # Maximum typing delay (ms)
+set STEALTH_RUN_SEED=12345  # optional: make stealth engines deterministic
 ```
 
 ## Troubleshooting

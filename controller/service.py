@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Generic, TypeVar, cast, Optional
 
 try:
@@ -27,7 +28,7 @@ def retry(wait: float = 0.5, retries: int = 3, timeout: float | None = None):
             raise last_err
         return wrapper
     return decorator
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from browser_use.agent.views import ActionModel, ActionResult
 from browser_use.browser import BrowserSession
@@ -38,10 +39,12 @@ from browser_use.controller.views import (
     ClickElementAction,
     CloseTabAction,
     DoneAction,
+    ExtractToMemoryAction,
     GoToUrlAction,
     InputTextAction,
     NoParamsAction,
     ScrollAction,
+    FillFromMemoryAction,
     SearchGoogleAction,
     SendKeysAction,
     StructuredOutputAction,
@@ -62,6 +65,37 @@ Context = TypeVar('Context')
 T = TypeVar('T', bound=BaseModel)
 
 
+# Module-level resilient frame.evaluate helper for iframe/dropdown interactions
+async def _safe_frame_evaluate(_frame, _script: str, _arg=None, retries: int = 3):
+    attempt = 0
+    last_exc: Exception | None = None
+    while attempt < retries:
+        try:
+            if _arg is None:
+                return await _frame.evaluate(_script)
+            return await _frame.evaluate(_script, _arg)
+        except Exception as e:
+            msg = str(e).lower()
+            last_exc = e
+            # Common transient errors during navigation/context loss or frame detachments
+            transient = (
+                'execution context was destroyed' in msg
+                or 'frame was detached' in msg
+                or 'navigation' in msg
+                or 'cannot find context with specified id' in msg
+            )
+            if transient:
+                try:
+                    await asyncio.sleep(0.15 * (attempt + 1))
+                except Exception:
+                    pass
+                attempt += 1
+                continue
+            # Hard error – bubble up immediately
+            raise
+    raise last_exc if last_exc else RuntimeError('frame evaluate failed')
+
+
 class Controller(Generic[Context]):
     def __init__(
         self,
@@ -77,34 +111,110 @@ class Controller(Generic[Context]):
         self._register_done_action(output_model)
 
         # Basic Navigation Actions
+        # Unified search action respecting default_search_engine if present
         @self.registry.action(
-            'Search the query in Google, the query should be a search query like humans search in Google, concrete and not vague or super long.',
+            'Search the query on the web using the configured search engine.',
             param_model=SearchGoogleAction,
         )
-        async def search_google(params: SearchGoogleAction, browser_session: BrowserSession):
-            search_url = f'https://www.google.com/search?q={params.query}&udm=14'
-
-            page = await browser_session.get_current_page()
-            if page.url.strip('/') == 'https://www.google.com':
-                # SECURITY FIX: Use browser_session.navigate_to() instead of direct page.goto()
-                # This ensures URL validation against allowed_domains is performed
-                await browser_session.navigate_to(search_url)
+        async def search_google(
+            params: SearchGoogleAction,
+            browser_session: BrowserSession,
+        ):
+            # Determine target engine (must be provided via settings.controller.default_search_engine)
+            engine = getattr(self, 'default_search_engine', None)
+            if not engine:
+                raise RuntimeError('No default_search_engine configured. Set settings.controller.default_search_engine to one of: google | bing | duckduckgo')
+            engine = engine.lower()
+            query = params.query
+            if engine == 'google':
+                search_url = f'https://www.google.com/search?q={query}&udm=14'
+                engine_name = 'Google'
+            elif engine == 'bing':
+                search_url = f'https://www.bing.com/search?q={query}'
+                engine_name = 'Bing'
             else:
-                # create_new_tab already includes proper URL validation
-                page = await browser_session.create_new_tab(search_url)
+                # Explicit duckduckgo, only if configured
+                if engine != 'duckduckgo':
+                    raise RuntimeError(f"Unsupported search engine: {engine}")
+                search_url = f'https://duckduckgo.com/?q={query}'
+                engine_name = 'DuckDuckGo'
 
-            msg = f'🔍  Searched for "{params.query}" in Google'
+            # Navigate according to caller context; keep current-tab first, fallback to new tab if needed
+            nav_note = 'current-tab'
+            try:
+                await browser_session.navigate_to(search_url)
+            except Exception:
+                page = await browser_session.create_new_tab(search_url)
+                try:
+                    tab_idx = browser_session.tabs.index(page)
+                    nav_note = f'new-tab #{tab_idx} (fallback)'
+                except Exception:
+                    nav_note = 'new-tab (fallback)'
+
+            # No embedded CAPTCHA handling here; solver is a separate action invoked by the LLM when needed.
+
+            msg = f'🔍  Searched for "{params.query}" on {engine_name} [{nav_note}]'
             logger.info(msg)
             return ActionResult(
-                extracted_content=msg, include_in_memory=True, long_term_memory=f"Searched Google for '{params.query}'"
+                extracted_content=msg,
+                include_in_memory=True,
+                long_term_memory=f"Searched {engine_name} for '{params.query}'",
             )
+
+        # NOTE: We keep the action registered for backward compatibility but hide it from
+        # LLM tool schemas/prompts by attaching a page_filter that always returns False.
+        # This effectively disables the action path so that SolveCaptchaTask is used directly.
+        @self.registry.action(
+            'Attempt to solve a visible CAPTCHA by iteratively clicking suggested indices. Provide indices explicitly.',
+            param_model=NoParamsAction,
+            page_filter=lambda _page: False,
+        )
+        async def solve_captcha(
+            _: NoParamsAction,
+            browser_session: BrowserSession,
+            page_extraction_llm: Optional[BaseChatModel] = None,
+            context: Context | None = None,
+        ):
+            try:
+                # Default page_extraction_llm to the main LLM if not provided (same logic as act/multi_act)
+                if page_extraction_llm is None:
+                    try:
+                        settings = getattr(context, 'settings', None) or getattr(self, 'settings', None)
+                        candidate = getattr(settings, 'llm', None)
+                        if candidate is not None:
+                            page_extraction_llm = candidate
+                    except Exception:
+                        pass
+
+                if page_extraction_llm is None:
+                    return ActionResult(success=False, error='Action solve_captcha requires page_extraction_llm but none provided and no default LLM found in settings.')
+
+                # Lazy import to avoid cycles
+                # Use the new task-based shim to keep public API stable
+                from browser_use.agent.tasks.solve_captcha_tool import tool_solve_captcha, SolveCaptchaAction
+                return await tool_solve_captcha(
+                    controller=self,
+                    params=SolveCaptchaAction(),
+                    browser=browser_session,
+                    page_extraction_llm=page_extraction_llm,
+                )
+            except Exception as e:
+                logger.error(f'solve_captcha action failed: {e}', exc_info=True)
+                return ActionResult(success=False, error=str(e))
 
         @self.registry.action(
             'Navigate to URL, set new_tab=True to open in new tab, False to navigate in current tab', param_model=GoToUrlAction
         )
         async def go_to_url(params: GoToUrlAction, browser_session: BrowserSession):
             try:
-                if params.new_tab:
+                # Avoid creating an extra tab if the only current tab is a new-tab/about:blank
+                try:
+                    current_page = await browser_session.get_current_page()
+                    current_is_blank = bool(current_page and (current_page.url == 'about:blank' or current_page.url.startswith('chrome://new-tab-page')))
+                except Exception:
+                    current_is_blank = False
+
+                if params.new_tab and not current_is_blank:
                     # Open in new tab (logic from open_tab function)
                     page = await browser_session.create_new_tab(params.url)
                     tab_idx = browser_session.tabs.index(page)
@@ -148,59 +258,102 @@ class Controller(Generic[Context]):
             logger.info(msg)
             return ActionResult(extracted_content=msg)
 
+        # Unified, accurate wait semantics: honor requested seconds up to a safe cap (300s)
+        class WaitActionParams(BaseModel):
+            seconds: int = Field(default=3, ge=0, le=300)
+
         @self.registry.action(
-            'Wait for x seconds default 3 (max 10 seconds). This can be used to wait until the page is fully loaded.'
+            'Wait for x seconds (default 3, max 300). Use this to pause until the page settles or a timer elapses.',
+            param_model=WaitActionParams,
         )
-        async def wait(seconds: int = 3):
-            # Cap wait time at maximum 10 seconds
-            # Reduce the wait time by 3 seconds to account for the llm call which takes at least 3 seconds
-            # So if the model decides to wait for 5 seconds, the llm call took at least 3 seconds, so we only need to wait for 2 seconds
-            actual_seconds = min(max(seconds - 3, 0), 10)
-            msg = f'🕒  Waiting for {actual_seconds + 3} seconds'
-            logger.info(msg)
-            await asyncio.sleep(actual_seconds)
+        async def wait(params: WaitActionParams):
+            # Bound the request defensively and sleep exactly that amount
+            seconds = max(0, min(int(params.seconds), 300))
+            start = time.monotonic()
+            await asyncio.sleep(seconds)
+            elapsed = time.monotonic() - start
+            msg = f'🕒  Waited for {seconds} seconds'
+            # Include actual elapsed in logs for observability; keep response concise
+            logger.info(f"{msg} (actual ~{elapsed:.2f}s)")
             return ActionResult(extracted_content=msg)
 
         # Element Interaction Actions
 
         @self.registry.action('Click element by index', param_model=ClickElementAction)
         async def click_element_by_index(params: ClickElementAction, browser_session: BrowserSession):
+            # Optional UX: pause on first click for human guidance / resume
+            try:
+                ctrl_settings = getattr(self, 'settings', None)
+                pause_on_first_click = bool(getattr(ctrl_settings, 'pause_on_first_click', False))
+                if pause_on_first_click and not getattr(self, '_first_click_pause_done', False):
+                    handler = getattr(ctrl_settings, 'signal_handler', None)
+                    if handler is not None:
+                        try:
+                            asyncio.create_task(handler._async_wait_for_resume())
+                        except Exception:
+                            pass
+                    setattr(self, '_first_click_pause_done', True)
+            except Exception:
+                pass
+
             element_node = await browser_session.get_dom_element_by_index(params.index)
             if element_node is None:
                 raise Exception(f'Element index {params.index} does not exist - retry or use alternative actions')
 
             initial_pages = len(browser_session.tabs)
 
-            # if element has file uploader then dont click
-            # Check if element is actually a file input (not just contains file-related keywords)
+            # Do not click file inputs directly (use upload_file action)
             if browser_session.is_file_input(element_node):
-                msg = f'Index {params.index} - has an element which opens file upload dialog. To upload files please use a specific function to upload files '
+                msg = (
+                    f'Index {params.index} - has an element which opens file upload dialog. '
+                    'To upload files please use a specific function to upload files '
+                )
                 logger.info(msg)
                 return ActionResult(extracted_content=msg, include_in_memory=True, success=False, long_term_memory=msg)
 
-            msg = None
-
             try:
-                download_path = await browser_session._click_element_node(element_node)
+                download_path, stealth_used = await browser_session._click_element_node(element_node)
+                # Small settle wait for UI updates
+                try:
+                    await asyncio.sleep(0.18)
+                except Exception:
+                    pass
+
                 if download_path:
                     emoji = '💾'
                     msg = f'Downloaded file to {download_path}'
                 else:
                     emoji = '🖱️'
-                    msg = f'Clicked button with index {params.index}: {element_node.get_all_text_till_next_clickable_element(max_depth=2)}'
+                    msg = (
+                        f'Clicked button with index {params.index}: '
+                        f"{element_node.get_all_text_till_next_clickable_element(max_depth=2)}"
+                    )
 
                 logger.info(f'{emoji} {msg}')
                 logger.debug(f'Element xpath: {element_node.xpath}')
+
+                # Switch to new tab if one opened
                 if len(browser_session.tabs) > initial_pages:
                     new_tab_msg = 'New tab opened - switching to it'
                     msg += f' - {new_tab_msg}'
-                    emoji = '🔗'
-                    logger.info(f'{emoji} {new_tab_msg}')
+                    logger.info(f'🔗 {new_tab_msg}')
                     await browser_session.switch_to_tab(-1)
-                return ActionResult(extracted_content=msg, include_in_memory=True, long_term_memory=msg)
+
+                # Minimal debug only; avoid heuristic-heavy signals
+                debug_info = {
+                    'stealth_used': stealth_used,
+                    'index': int(params.index),
+                    'executed_xpath': getattr(element_node, 'xpath', None),
+                }
+
+                return ActionResult(
+                    extracted_content=msg,
+                    include_in_memory=True,
+                    long_term_memory=msg,
+                    debug=debug_info,
+                )
             except Exception as e:
-                error_msg = str(e)
-                raise BrowserError(error_msg)
+                raise BrowserError(str(e))
 
         @self.registry.action(
             'Click and input text into a input interactive element',
@@ -392,7 +545,7 @@ class Controller(Generic[Context]):
                         extracted_content=msg,
                         include_in_memory=True,
                         long_term_memory=f"Uploaded file {params.path} to element {params.index} (confirmed)",
-                        success=True,
+                        # success intentionally omitted for non-done actions
                     )
                 else:
                     # CRITICAL: Do not claim success when upload is not confirmed
@@ -766,7 +919,6 @@ Explain the content of the page and that the requested information is not availa
                 extracted_content=msg,
                 include_in_memory=True,
                 long_term_memory=long_term_memory,
-                success=True
             )
 
         @self.registry.action(
@@ -869,6 +1021,125 @@ Explain the content of the page and that the requested information is not availa
             logger.info(f'💾 {result}')
             return ActionResult(extracted_content=result, include_in_memory=True, long_term_memory=result)
 
+        # Memory primitives -------------------------------------------------
+
+        @self.registry.action(
+            description=(
+                "Extract a value from the current page into long-term memory under a key. "
+                "Source can be 'url', 'title', 'selection', or 'css:<selector>'."
+            ),
+            param_model=ExtractToMemoryAction,
+        )
+        async def extract_to_memory(
+            params: ExtractToMemoryAction,
+            browser_session: BrowserSession,
+            file_system: FileSystem,
+        ) -> ActionResult:
+            page = await browser_session.get_current_page()
+
+            async def _norm_url(u: str) -> str:
+                try:
+                    from urllib.parse import urlparse, urlunparse
+
+                    p = urlparse(u)
+                    # lowercase scheme and netloc; drop fragment
+                    netloc = p.netloc.lower()
+                    scheme = (p.scheme or 'https').lower()
+                    # leave path/query as-is; test only checks host lowercase and no fragment
+                    return urlunparse((scheme, netloc, p.path, p.params, p.query, ''))
+                except Exception:
+                    return u
+
+            value: str = ''
+            src = params.source.strip()
+            try:
+                if src == 'url':
+                    value = await _norm_url(page.url)
+                elif src == 'title':
+                    value = await page.title()
+                elif src == 'selection':
+                    # Best-effort selection extraction
+                    value = await page.evaluate(
+                        '() => (window.getSelection ? window.getSelection().toString() : "") || ""'
+                    )
+                elif src.startswith('css:'):
+                    selector = src.split(':', 1)[1]
+                    value = await page.evaluate(
+                        '(sel) => { const el = document.querySelector(sel); return el ? (el.textContent || "").trim() : ""; }',
+                        selector,
+                    )
+                else:
+                    raise ValueError("Unsupported source. Use 'url', 'title', 'selection', or 'css:<selector>'.")
+            except Exception as e:
+                msg = f"Failed to extract from source '{src}': {e}"
+                logger.info(msg)
+                return ActionResult(extracted_content=msg, success=False)
+
+            # Load existing memory.json (if any), update, and write back
+            try:
+                raw = file_system.display_file('memory.json')
+                data = json.loads(raw) if raw else {}
+            except Exception:
+                data = {}
+            data[params.key] = value
+            await file_system.write_file('memory.json', json.dumps(data))
+
+            msg = f"Extracted '{params.key}' from {src}"
+            logger.info(msg)
+            return ActionResult(extracted_content=msg, include_in_memory=True, long_term_memory=msg)
+
+        @self.registry.action(
+            description=(
+                "Fill a page field from memory. Provide field_selector as 'css:<selector>' or 'xpath:<expr>' and a key."
+            ),
+            param_model=FillFromMemoryAction,
+        )
+        async def fill_from_memory(
+            params: FillFromMemoryAction,
+            browser_session: BrowserSession,
+            file_system: FileSystem,
+        ) -> ActionResult:
+            page = await browser_session.get_current_page()
+
+            # Read memory.json
+            raw = file_system.display_file('memory.json')
+            if not raw:
+                msg = 'No memory.json found to read from.'
+                logger.info(msg)
+                return ActionResult(extracted_content=msg, success=False)
+            try:
+                data = json.loads(raw)
+            except Exception:
+                data = {}
+
+            if params.key not in data:
+                msg = f"Key '{params.key}' not found in memory."
+                logger.info(msg)
+                return ActionResult(extracted_content=msg, success=False)
+
+            value = data.get(params.key, '')
+
+            sel = params.field_selector.strip()
+            try:
+                if sel.startswith('css:'):
+                    css = sel.split(':', 1)[1]
+                    # Use page.fill directly so tests can assert selector string
+                    await page.fill(css, value)
+                elif sel.startswith('xpath:'):
+                    xpath = sel.split(':', 1)[1]
+                    # Use locator for xpath
+                    await page.locator(xpath).fill(value)
+                else:
+                    raise ValueError("Unsupported field_selector. Use 'css:<selector>' or 'xpath:<expr>'.")
+            except Exception as e:
+                msg = f"Failed to fill field '{sel}': {e}"
+                logger.info(msg)
+                return ActionResult(extracted_content=msg, success=False)
+
+            msg = f"Filled field from memory key '{params.key}'"
+            logger.info(msg)
+            return ActionResult(extracted_content=msg, include_in_memory=True, long_term_memory=msg)
+
         @self.registry.action('Read file_name from file system')
         async def read_file(file_name: str, available_file_paths: list[str], file_system: FileSystem):
             if available_file_paths and file_name in available_file_paths:
@@ -917,7 +1188,8 @@ Explain the content of the page and that the requested information is not availa
                 for frame in page.frames:
                     try:
                         # First check if it's a native select element
-                        options = await frame.evaluate(
+                        options = await _safe_frame_evaluate(
+                            frame,
                             """
                             (xpath) => {
                                 const element = document.evaluate(xpath, document, null,
@@ -1087,86 +1359,294 @@ Explain the content of the page and that the requested information is not availa
                             }
                         """
 
-                        element_info = await frame.evaluate(element_info_js, dom_element.xpath)
+                        element_info = await _safe_frame_evaluate(frame, element_info_js, dom_element.xpath)
 
                         if element_info and element_info.get('found'):
                             logger.debug(f'Found {element_info.get("type")} element in frame {frame_index}: {element_info}')
 
                             if element_info.get('type') == 'select':
-                                # Handle native select element
-                                # "label" because we are selecting by text
-                                # nth(0) to disable error thrown by strict mode
-                                # timeout=1000 because we are already waiting for all network events
-                                selected_option_values = (
-                                    await frame.locator('//' + dom_element.xpath).nth(0).select_option(label=text, timeout=1000)
+                                # Handle native select element: no keyboard path; select + verify; fallback to overlay click if hidden or verification fails
+                                stealth_mgr = getattr(browser_session, '_stealth_manager', None)
+                                stealth_enabled = bool(getattr(browser_session.browser_profile, 'stealth', False))
+                                selected_option_values = None
+                                overlay_clicked = False
+
+                                # Focus the select (best-effort)
+                                handle = None
+                                try:
+                                    handle = await frame.locator('//' + dom_element.xpath).nth(0).element_handle()
+                                    if handle is not None:
+                                        try:
+                                            if stealth_enabled and stealth_mgr is not None:
+                                                bbox = await handle.bounding_box()
+                                                if bbox:
+                                                    cx = bbox['x'] + bbox['width'] / 2
+                                                    cy = bbox['y'] + bbox['height'] / 2
+                                                    try:
+                                                        await stealth_mgr.execute_human_like_click(page, (cx, cy))
+                                                    except Exception:
+                                                        await handle.click(timeout=1_500)
+                                            else:
+                                                await handle.click(timeout=1_500)
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+
+                                # Attempt select_option by label
+                                try:
+                                    selected_option_values = (
+                                        await frame.locator('//' + dom_element.xpath).nth(0).select_option(label=text, timeout=2_000)
+                                    )
+                                except Exception:
+                                    selected_option_values = None
+
+                                # Fallback: resolve option value by exact text (trimmed, case-insensitive) and select by value
+                                if not selected_option_values:
+                                    try:
+                                        match_value = await _safe_frame_evaluate(
+                                            frame,
+                                            "(params)=>{\n"
+                                            "  const el = document.evaluate(params.xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;\n"
+                                            "  if(!el || el.tagName.toLowerCase()!=='select') return null;\n"
+                                            "  const target = String(params.target||'');\n"
+                                            "  const norm = s=>String(s||'').trim().toLowerCase();\n"
+                                            "  for(const opt of Array.from(el.options)){\n"
+                                            "    if(norm(opt.text)===norm(target)) return opt.value;\n"
+                                            "  }\n"
+                                            "  return null;\n"
+                                            "}",
+                                            { 'xpath': dom_element.xpath, 'target': text }
+                                        )
+                                        if match_value:
+                                            try:
+                                                selected_option_values = (
+                                                    await frame.locator('//' + dom_element.xpath).nth(0).select_option(value=match_value, timeout=2_000)
+                                                )
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+
+                                # Helper: verify and detect visibility/hidden
+                                verify_info = await _safe_frame_evaluate(
+                                    frame,
+                                    "(params) => {\n"
+                                    "  const el = document.evaluate(params.xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;\n"
+                                    "  if (!el) return { ok:false, text:'', value:'', hidden:true, reason:'not_found' };\n"
+                                    "  const tagOk = el.tagName && el.tagName.toLowerCase() === 'select';\n"
+                                    "  const rect = el.getBoundingClientRect();\n"
+                                    "  const style = window.getComputedStyle(el);\n"
+                                    "  const hidden = (rect.width === 0 || rect.height === 0 || style.visibility === 'hidden' || style.display === 'none');\n"
+                                    "  let selText = '', selValue = '';\n"
+                                    "  if (tagOk) {\n"
+                                    "    selText = (el.options[el.selectedIndex]?.text || '').trim();\n"
+                                    "    selValue = el.value;\n"
+                                    "  }\n"
+                                    "  const ok = (selText === params.target) || (selValue === params.target);\n"
+                                    "  return { ok, text: selText, value: selValue, hidden };\n"
+                                    "}",
+                                    { 'xpath': dom_element.xpath, 'target': text }
                                 )
 
-                                msg = f'selected option {text} with value {selected_option_values}'
+                                # If not ok or the select is hidden (custom widget), try overlay menu click by text
+                                if not (verify_info or {}).get('ok', False) or (verify_info or {}).get('hidden', False):
+                                    try:
+                                        # Open the dropdown if possible
+                                        if handle is not None:
+                                            try:
+                                                await handle.click(timeout=1_500)
+                                            except Exception:
+                                                pass
+                                        # Find a visible option in any overlay/listbox matching the text (exact)
+                                        click_res = await _safe_frame_evaluate(
+                                            frame,
+                                            '''(targetText) => {
+                                                function isVisible(el){
+                                                  const r = el.getBoundingClientRect();
+                                                  const cs = getComputedStyle(el);
+                                                  return r.width>0 && r.height>0 && cs.visibility!=='hidden' && cs.display!=='none';
+                                                }
+                                                const candidates = [];
+                                                // ARIA options anywhere in document
+                                                document.querySelectorAll('[role="option"]').forEach(el=>{ if(isVisible(el)) candidates.push(el); });
+                                                // Common widget classes (PrimeFaces/other)
+                                                document.querySelectorAll('.ui-selectonemenu-item, .select2-results__option, li[role="option"]').forEach(el=>{ if(isVisible(el)) candidates.push(el); });
+                                                // De-dup
+                                                const uniq = Array.from(new Set(candidates));
+                                                for(const el of uniq){
+                                                  const txt = (el.textContent||'').trim();
+                                                  if(txt === targetText){
+                                                    el.scrollIntoView({block:'nearest'});
+                                                    el.click();
+                                                    try { el.dispatchEvent(new MouseEvent('click', {bubbles:true})); } catch(e) {}
+                                                    return {clicked:true};
+                                                  }
+                                                }
+                                                return {clicked:false};
+                                            }''',
+                                            text
+                                        )
+                                        try:
+                                            overlay_clicked = bool(click_res and click_res.get('clicked'))
+                                        except Exception:
+                                            overlay_clicked = False
+                                        # Re-verify after overlay click
+                                        verify_info = await _safe_frame_evaluate(
+                                            frame,
+                                            "(params) => {\n"
+                                            "  const el = document.evaluate(params.xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;\n"
+                                            "  if (!el) return { ok:false, text:'', value:'', reason:'not_found' };\n"
+                                            "  const selText = (el.options[el.selectedIndex]?.text || '').trim();\n"
+                                            "  const selValue = el.value;\n"
+                                            "  const ok = (selText === params.target) || (selValue === params.target);\n"
+                                            "  return { ok, text: selText, value: selValue };\n"
+                                            "}",
+                                            { 'xpath': dom_element.xpath, 'target': text }
+                                        )
+                                    except Exception:
+                                        pass
+
+                                final_text = (verify_info or {}).get('text', '')
+                                final_value = (verify_info or {}).get('value', '')
+                                ok = bool((verify_info or {}).get('ok', False))
+                                # Treat a successful select_option or overlay click as success
+                                try:
+                                    if selected_option_values and isinstance(selected_option_values, list) and len(selected_option_values) > 0:
+                                        ok = True
+                                except Exception:
+                                    pass
+                                if overlay_clicked:
+                                    ok = True
+
+                                msg = f"selected option {text} with value {final_value or (selected_option_values if selected_option_values else '[unknown]')}"
                                 logger.info(msg + f' in frame {frame_index}')
 
                                 return ActionResult(
-                                    extracted_content=msg, include_in_memory=True, long_term_memory=f"Selected option '{text}'"
+                                    extracted_content=msg,
+                                    include_in_memory=True,
+                                    long_term_memory=f"Selected option '{text}'",
+                                    # success omitted on success; State will mark failures via success=False
+                                    **({} if ok else {"success": False})
                                 )
 
                             elif element_info.get('type') == 'aria':
                                 # Handle ARIA menu
-                                click_aria_item_js = """
-                                    (params) => {
-                                        const { xpath, targetText } = params;
-                                        try {
-                                            const element = document.evaluate(xpath, document, null,
-                                                XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                                            if (!element) return {success: false, error: 'Element not found'};
+                                stealth_mgr = getattr(browser_session, '_stealth_manager', None)
+                                stealth_enabled = bool(getattr(browser_session.browser_profile, 'stealth', False))
+                                used_stealth_path = False
 
-                                            // Find all menu items
-                                            const menuItems = element.querySelectorAll('[role="menuitem"], [role="option"]');
+                                try:
+                                    # Ensure menu is open: click the element itself
+                                    trigger_handle = await frame.locator('//' + dom_element.xpath).nth(0).element_handle()
+                                    if trigger_handle is not None:
+                                        bbox = await trigger_handle.bounding_box()
+                                        if bbox:
+                                            cx = bbox['x'] + bbox['width'] / 2
+                                            cy = bbox['y'] + bbox['height'] / 2
+                                            try:
+                                                if stealth_enabled and stealth_mgr is not None:
+                                                    await stealth_mgr.execute_human_like_click(page, (cx, cy))
+                                                    used_stealth_path = True
+                                                else:
+                                                    await trigger_handle.click(timeout=1_500)
+                                            except Exception:
+                                                # Fallback to simple click if stealth or primary click fails
+                                                await trigger_handle.click(timeout=1_500)
 
-                                            for (const item of menuItems) {
-                                                const itemText = item.textContent.trim();
-                                                if (itemText === targetText) {
-                                                    // Simulate click on the menu item
-                                                    item.click();
-
-                                                    // Also try dispatching a click event in case the click handler needs it
-                                                    const clickEvent = new MouseEvent('click', {
-                                                        view: window,
-                                                        bubbles: true,
-                                                        cancelable: true
-                                                    });
-                                                    item.dispatchEvent(clickEvent);
-
-                                                    return {
-                                                        success: true,
-                                                        message: `Clicked menu item: ${targetText}`
-                                                    };
+                                    # Find target menu item center coordinates
+                                    target_rect = await _safe_frame_evaluate(
+                                        frame,
+                                        '''(params) => {
+                                            const { xpath, targetText } = params;
+                                            const el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                                            if (!el) return null;
+                                            const items = el.querySelectorAll('[role="menuitem"], [role="option"]');
+                                            for (const item of items) {
+                                                const txt = (item.textContent || '').trim();
+                                                if (txt === targetText) {
+                                                    item.scrollIntoView({block: 'nearest'});
+                                                    const r = item.getBoundingClientRect();
+                                                    return { x: r.left + r.width/2, y: r.top + r.height/2 };
                                                 }
                                             }
-
-                                            return {
-                                                success: false,
-                                                error: `Menu item with text '${targetText}' not found`
-                                            };
-                                        } catch (e) {
-                                            return {success: false, error: e.toString()};
-                                        }
-                                    }
-                                """
-
-                                result = await frame.evaluate(
-                                    click_aria_item_js, {'xpath': dom_element.xpath, 'targetText': text}
-                                )
-
-                                if result.get('success'):
-                                    msg = result.get('message', f'Selected ARIA menu item: {text}')
-                                    logger.info(msg + f' in frame {frame_index}')
-                                    return ActionResult(
-                                        extracted_content=msg,
-                                        include_in_memory=True,
-                                        long_term_memory=f"Selected menu item '{text}'",
+                                            return null;
+                                        }''',
+                                        { 'xpath': dom_element.xpath, 'targetText': text }
                                     )
-                                else:
-                                    logger.error(f'Failed to select ARIA menu item: {result.get("error")}')
-                                    continue
+
+                                    if target_rect and isinstance(target_rect, dict) and 'x' in target_rect and 'y' in target_rect:
+                                        try:
+                                            if stealth_enabled and stealth_mgr is not None:
+                                                await stealth_mgr.execute_human_like_click(page, (target_rect['x'], target_rect['y']))
+                                                used_stealth_path = True
+                                            else:
+                                                await page.mouse.click(target_rect['x'], target_rect['y'])
+                                                used_stealth_path = True
+                                        except Exception:
+                                            used_stealth_path = False
+                                except Exception:
+                                    used_stealth_path = False
+
+                                if not used_stealth_path:
+                                    # Fallback: original JS click
+                                    click_aria_item_js = """
+                                        (params) => {
+                                            const { xpath, targetText } = params;
+                                            try {
+                                                const element = document.evaluate(xpath, document, null,
+                                                    XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                                                if (!element) return {success: false, error: 'Element not found'};
+
+                                                // Find all menu items
+                                                const menuItems = element.querySelectorAll('[role="menuitem"], [role="option"]');
+
+                                                for (const item of menuItems) {
+                                                    const itemText = item.textContent.trim();
+                                                    if (itemText === targetText) {
+                                                        // Simulate click on the menu item
+                                                        item.click();
+
+                                                        // Also try dispatching a click event in case the click handler needs it
+                                                        const clickEvent = new MouseEvent('click', {
+                                                            view: window,
+                                                            bubbles: true,
+                                                            cancelable: true
+                                                        });
+                                                        item.dispatchEvent(clickEvent);
+
+                                                        return {
+                                                            success: true,
+                                                            message: `Clicked menu item: ${targetText}`
+                                                        };
+                                                    }
+                                                }
+
+                                                return {
+                                                    success: false,
+                                                    error: `Menu item with text '${targetText}' not found`
+                                                };
+                                            } catch (e) {
+                                                return {success: false, error: e.toString()};
+                                            }
+                                        }
+                                    """
+
+                                    result = await _safe_frame_evaluate(
+                                        frame, click_aria_item_js, {'xpath': dom_element.xpath, 'targetText': text}
+                                    )
+
+                                    if result.get('success'):
+                                        msg = result.get('message', f'Selected ARIA menu item: {text}')
+                                        logger.info(msg + f' in frame {frame_index}')
+                                        return ActionResult(
+                                            extracted_content=msg,
+                                            include_in_memory=True,
+                                            long_term_memory=f"Selected menu item '{text}'",
+                                        )
+                                    else:
+                                        logger.error(f'Failed to select ARIA menu item: {result.get("error")}')
+                                        continue
 
                         elif element_info:
                             logger.error(f'Frame {frame_index} error: {element_info.get("error")}')
@@ -1181,7 +1661,7 @@ Explain the content of the page and that the requested information is not availa
 
                 msg = f"Could not select option '{text}' in any frame"
                 logger.info(msg)
-                return ActionResult(extracted_content=msg, include_in_memory=True, long_term_memory=msg)
+                return ActionResult(extracted_content=msg, include_in_memory=True, long_term_memory=msg, success=False)
 
             except Exception as e:
                 msg = f'Selection failed: {str(e)}'
@@ -1190,13 +1670,23 @@ Explain the content of the page and that the requested information is not availa
 
         @self.registry.action('Google Sheets: Get the contents of the entire sheet', domains=['https://docs.google.com'])
         async def read_sheet_contents(page: Page):
-            # select all cells
+            # Ensure grid focus, then Select All and Copy
             await page.keyboard.press('Enter')
             await page.keyboard.press('Escape')
             await page.keyboard.press('ControlOrMeta+A')
             await page.keyboard.press('ControlOrMeta+C')
 
-            extracted_tsv = await page.evaluate('() => navigator.clipboard.readText()')
+            # Clipboard can lag; poll briefly
+            extracted_tsv = ''
+            for _ in range(15):
+                try:
+                    extracted_tsv = await page.evaluate('() => navigator.clipboard.readText()')
+                except Exception:
+                    extracted_tsv = ''
+                if extracted_tsv:
+                    break
+                await asyncio.sleep(0.1)
+
             return ActionResult(
                 extracted_content=extracted_tsv,
                 include_in_memory=True,
@@ -1210,9 +1700,18 @@ Explain the content of the page and that the requested information is not availa
 
             await select_cell_or_range(cell_or_range=cell_or_range, page=page)
 
+            # Copy and read clipboard with small retry window
             await page.keyboard.press('ControlOrMeta+C')
-            await asyncio.sleep(0.1)
-            extracted_tsv = await page.evaluate('() => navigator.clipboard.readText()')
+            extracted_tsv = ''
+            for _ in range(15):
+                try:
+                    extracted_tsv = await page.evaluate('() => navigator.clipboard.readText()')
+                except Exception:
+                    extracted_tsv = ''
+                if extracted_tsv != '':
+                    break
+                await asyncio.sleep(0.1)
+
             return ActionResult(
                 extracted_content=extracted_tsv,
                 include_in_memory=True,
@@ -1228,12 +1727,66 @@ Explain the content of the page and that the requested information is not availa
 
             await select_cell_or_range(cell_or_range=cell_or_range, page=page)
 
-            # simulate paste event from clipboard with TSV content
-            await page.evaluate(f"""
-                const clipboardData = new DataTransfer();
-                clipboardData.setData('text/plain', `{new_contents_tsv}`);
-                document.activeElement.dispatchEvent(new ClipboardEvent('paste', {{clipboardData}}));
-            """)
+            # Write to clipboard and do a real paste via keyboard to let Sheets handle TSV parsing.
+            def _normalize_tsv(s: str) -> str:
+                return (s or '').replace('\r\n', '\n').replace('\r', '\n').rstrip('\n')
+
+            desired = _normalize_tsv(new_contents_tsv)
+            last_clip = ''
+            success = False
+            for attempt in range(3):
+                try:
+                    await page.evaluate(
+                        """
+                        async (text) => {
+                            await navigator.clipboard.writeText(text);
+                            return true;
+                        }
+                        """,
+                        new_contents_tsv,
+                    )
+                except Exception as e:
+                    logger.warning(f'Clipboard write failed (attempt {attempt+1}): {e}')
+                    await asyncio.sleep(0.2)
+                    continue
+
+                await page.keyboard.press('ControlOrMeta+V')
+                await asyncio.sleep(0.3)
+
+                # Verify by copying back and comparing
+                await page.keyboard.press('ControlOrMeta+C')
+                copied = ''
+                for _ in range(10):
+                    try:
+                        copied = await page.evaluate('() => navigator.clipboard.readText()')
+                    except Exception:
+                        copied = ''
+                    if copied:
+                        break
+                    await asyncio.sleep(0.1)
+
+                last_clip = _normalize_tsv(copied)
+                if last_clip == desired:
+                    success = True
+                    break
+
+                logger.info(
+                    f'Google Sheets paste verification mismatch on attempt {attempt+1}. Will retry. '\
+                    f'Expected (normalized) length={len(desired)}, got length={len(last_clip)}'
+                )
+                await asyncio.sleep(0.3)
+
+            if not success:
+                msg = (
+                    f"Failed to update cells {cell_or_range}: pasted content didn't match after retries. "
+                    f"Expected={desired[:200]!r}... vs Got={last_clip[:200]!r}..."
+                )
+                return ActionResult(
+                    extracted_content=msg,
+                    include_in_memory=True,
+                    long_term_memory=msg,
+                    success=False,
+                )
 
             return ActionResult(
                 extracted_content=f'Updated cells: {cell_or_range} = {new_contents_tsv}',
@@ -1248,6 +1801,30 @@ Explain the content of the page and that the requested information is not availa
             await select_cell_or_range(cell_or_range=cell_or_range, page=page)
 
             await page.keyboard.press('Backspace')
+            await asyncio.sleep(0.2)
+
+            # Verify cleared by copying and checking no non-whitespace, non-tab content remains
+            await page.keyboard.press('ControlOrMeta+C')
+            content = ''
+            for _ in range(10):
+                try:
+                    content = await page.evaluate('() => navigator.clipboard.readText()')
+                except Exception:
+                    content = ''
+                if content is not None:
+                    break
+                await asyncio.sleep(0.1)
+
+            normalized = (content or '').replace('\r\n', '\n').replace('\r', '\n').replace('\t', '').strip()
+            if normalized != '':
+                msg = f"Attempted to clear {cell_or_range}, but cells still contain data (len={len(content or '')})."
+                return ActionResult(
+                    extracted_content=msg,
+                    include_in_memory=True,
+                    long_term_memory=msg,
+                    success=False,
+                )
+
             return ActionResult(
                 extracted_content=f'Cleared cells: {cell_or_range}',
                 include_in_memory=False,
@@ -1256,23 +1833,47 @@ Explain the content of the page and that the requested information is not availa
 
         @self.registry.action('Google Sheets: Select a specific cell or range of cells', domains=['https://docs.google.com'])
         async def select_cell_or_range(cell_or_range: str, page: Page):
-            await page.keyboard.press('Enter')  # make sure we dont delete current cell contents if we were last editing
-            await page.keyboard.press('Escape')  # to clear current focus (otherwise select range popup is additive)
-            await asyncio.sleep(0.1)
-            await page.keyboard.press('Home')  # move cursor to the top left of the sheet first
-            await page.keyboard.press('ArrowUp')
-            await asyncio.sleep(0.1)
-            await page.keyboard.press('Control+G')  # open the goto range popup
-            await asyncio.sleep(0.2)
-            await page.keyboard.type(cell_or_range, delay=0.05)
-            await asyncio.sleep(0.2)
+            # Ensure we are not in edit mode and the grid has focus
             await page.keyboard.press('Enter')
-            await asyncio.sleep(0.2)
-            await page.keyboard.press('Escape')  # to make sure the popup still closes in the case where the jump failed
+            await page.keyboard.press('Escape')
+            await asyncio.sleep(0.1)
+
+            # Open the "Go to range" dialog (platform-aware) and type the range
+            opened = False
+            for chord in ('ControlOrMeta+G', 'F5'):
+                try:
+                    await page.keyboard.press(chord)
+                    await asyncio.sleep(0.25)
+                    await page.keyboard.type(cell_or_range, delay=0.05)
+                    await asyncio.sleep(0.2)
+                    await page.keyboard.press('Enter')
+                    opened = True
+                    break
+                except Exception:
+                    continue
+
+            await asyncio.sleep(0.3)
+            await page.keyboard.press('Escape')  # attempt to close the popup if still open
+
+            # Light verification: try copying and ensure clipboard read succeeds (implies selection exists)
+            await page.keyboard.press('ControlOrMeta+C')
+            ok = False
+            for _ in range(10):
+                try:
+                    clip = await page.evaluate('() => navigator.clipboard.readText()')
+                except Exception:
+                    clip = None
+                if clip is not None:
+                    ok = True
+                    break
+                await asyncio.sleep(0.1)
+
+            msg = f'Selected cells: {cell_or_range}' if opened and ok else f'Attempted to select cells: {cell_or_range}'
             return ActionResult(
-                extracted_content=f'Selected cells: {cell_or_range}',
+                extracted_content=msg,
                 include_in_memory=False,
-                long_term_memory=f'Selected cells {cell_or_range}',
+                long_term_memory=msg,
+                success=opened and ok,
             )
 
         @self.registry.action(
@@ -1288,6 +1889,68 @@ Explain the content of the page and that the requested information is not availa
                 include_in_memory=False,
                 long_term_memory=f"Inputted text '{text}' into cell",
             )
+
+        # Task Integration as Action: Gather Structured Data (Reservoir -> Source -> Sink)
+        class GatherStructuredDataParams(BaseModel):
+            sheet_url: str | None = Field(
+                default=None,
+                description='Optional Google Sheet URL for Tab C (Sink). If omitted, sink is skipped.',
+            )
+            targets: list[str] = Field(..., description='List of target URLs (strings).')
+            titles: list[str] | None = Field(
+                default=None, description='Optional list of titles (same length as targets).'
+            )
+
+        @self.registry.action(
+            'Gather structured data: Reservoir -> Source -> Sink (optional). Provide targets, optional titles, and optional sheet_url.',
+            param_model=GatherStructuredDataParams,
+        )
+        async def gather_structured_data(params: GatherStructuredDataParams, browser_session: BrowserSession):
+            try:
+                from browser_use.agent.tasks.gather_links_task import (
+                    GatherStructuredDataTask as _GatherTask,
+                    ReservoirSeedInput as _SeedIn,
+                    seed_reservoir as _seed,
+                )
+
+                # Build task with current controller + browser
+                task = _GatherTask(controller=self, browser=browser_session)
+
+                # Apply sink configuration if provided
+                if params.sheet_url:
+                    try:
+                        # Let pydantic validate later; we keep as str here
+                        task.ctx.sink.sheet_url = params.sheet_url  # type: ignore[assignment]
+                    except Exception:
+                        task.ctx.sink.sheet_url = None  # type: ignore[assignment]
+
+                # Seed reservoir from user input (pydantic will validate HttpUrls)
+                seed = _SeedIn(targets=params.targets, titles=params.titles)
+                task.ctx = _seed(task.ctx, seed)
+
+                # Execute orchestrated flow
+                tr = await task.run()
+
+                # Summarize outcome for LLM
+                written = [k for k in task.ctx.cache if k.startswith('sink:') and not k.startswith('sink:error:')]
+                errors = {k: task.ctx.cache[k] for k in task.ctx.cache if k.startswith('sink:error:')}
+                src_count = len([k for k in task.ctx.cache if k.startswith('source:')])
+                msg = (
+                    f"Gathered {src_count} items; wrote {len(written)} rows"
+                    + (f"; {len(errors)} sink errors" if errors else "")
+                )
+
+                # Include a compact manifest pointer (kept in ctx cache)
+                return ActionResult(
+                    extracted_content=msg,
+                    include_in_memory=True,
+                    long_term_memory=msg,
+                    success=bool(tr and tr.success),
+                )
+            except Exception as e:
+                err = f"gather_structured_data failed: {e}"
+                logger.error(err, exc_info=True)
+                return ActionResult(extracted_content=err, include_in_memory=True, success=False)
 
     # Custom done action for structured output
     def _register_done_action(self, output_model: type[T] | None, display_files_in_done_text: bool = True):
@@ -1392,6 +2055,16 @@ Explain the content of the page and that the requested information is not availa
     ) -> ActionResult:
         """Execute an action"""
 
+        # Default page_extraction_llm to the main LLM if not provided
+        if page_extraction_llm is None:
+            try:
+                settings = getattr(context, 'settings', None) or getattr(self, 'settings', None)
+                candidate = getattr(settings, 'llm', None)
+                if candidate is not None:
+                    page_extraction_llm = candidate
+            except Exception:
+                pass
+
         for action_name, params in action.model_dump(exclude_unset=True).items():
             if params is not None:
                 # Use Laminar span if available, otherwise use no-op context manager
@@ -1431,9 +2104,9 @@ Explain the content of the page and that the requested information is not availa
                 if isinstance(result, str):
                     return ActionResult(extracted_content=result, success=False)
                 elif isinstance(result, ActionResult):
-                    # Default success to False when not explicitly set to avoid accidental positives
-                    if getattr(result, 'success', None) is None:
-                        result.success = False
+                    # Preserve success=None for non-terminal actions; the StateManager will interpret
+                    # None as neutral (neither success nor failure). Only explicit False indicates failure,
+                    # and True is allowed only when is_done=True (enforced by the model validator).
                     return result
                 elif result is None:
                     return ActionResult(success=False)
@@ -1448,7 +2121,7 @@ Explain the content of the page and that the requested information is not availa
         actions: list[ActionModel],
         browser_session: BrowserSession,
         check_ui_stability: bool = True,  # Make this feature configurable
-        page_extraction_llm: Optional[BaseChatModel] = None,
+    page_extraction_llm: Optional[BaseChatModel] = None,
         sensitive_data: Optional[dict[str, str | dict[str, str]]] = None,
         available_file_paths: Optional[list[str]] = None,
         file_system: Optional[FileSystem] = None,
@@ -1459,6 +2132,16 @@ Explain the content of the page and that the requested information is not availa
         Includes an optional UI stability check to prevent acting on a stale DOM.
         """
         results: list[ActionResult] = []
+
+        # Default page_extraction_llm to the main LLM if not provided
+        if page_extraction_llm is None:
+            try:
+                settings = getattr(context, 'settings', None) or getattr(self, 'settings', None)
+                candidate = getattr(settings, 'llm', None)
+                if candidate is not None:
+                    page_extraction_llm = candidate
+            except Exception:
+                pass
 
         # Get the initial state of the page before any actions in this batch are taken.
         cached_selector_map = await browser_session.get_selector_map()

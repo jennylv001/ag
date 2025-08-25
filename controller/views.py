@@ -123,6 +123,17 @@ class ExtractStructuredDataAction(BaseModel):
     extract_links: bool = Field(False, description="Set to True to include hyperlinks in the extracted text.")
 
 
+# Memory primitives
+class ExtractToMemoryAction(BaseModel):
+	key: str = Field(..., description="Memory key to store the extracted value under.")
+	source: str = Field(..., description="One of: 'url', 'title', 'selection', or 'css:<selector>' to extract from a specific element.")
+
+
+class FillFromMemoryAction(BaseModel):
+	field_selector: str = Field(..., description="Target input field to fill. Form 'css:<selector>' or 'xpath:<expr>'.")
+	key: str = Field(..., description="Memory key to read.")
+
+
 # File System Actions
 class WriteFileAction(BaseModel):
     file_name: str = Field(..., description="The name of the file to write to.")

@@ -1,0 +1,34 @@
+# General
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+.Python
+.DS_Store
+*.log
+
+# Virtual environments
+venv/
+.venv/
+
+# Node
+node_modules/
+npm-debug.log*
+pnpm-lock.yaml
+
+# Editor/OS
+.vscode/
+.idea/
+Thumbs.db
+
+# Build outputs
+dist/
+build/
+
+# Runtime/session artifacts
+Conversation/
+[0-9][0-9][0-9][0-9]_*/*
+
+# Local env/config
+.env
+.env.*

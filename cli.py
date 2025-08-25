@@ -918,8 +918,12 @@ class BrowserUseApp(App):
 
 						# Show goal if available
 						if item.model_output and hasattr(item.model_output, 'current_state'):
-							# Show goal for this step
-							goal = item.model_output.current_state.next_goal
+							# Show goal for this step (current_state is a dict)
+							try:
+								cs = item.model_output.current_state  # may be dict
+								goal = cs.get('next_goal') if isinstance(cs, dict) else getattr(cs, 'next_goal', None)
+							except Exception:
+								goal = None
 							if goal:
 								# Take just the first line for display
 								goal_lines = goal.strip().split('\n')
@@ -927,7 +931,11 @@ class BrowserUseApp(App):
 								tasks_info.write(f'   [cyan]Goal:[/] {goal_summary}')
 
 							# Show evaluation of previous goal (feedback)
-							eval_prev = item.model_output.current_state.prior_action_assessment
+							try:
+								cs = item.model_output.current_state
+								eval_prev = cs.get('prior_action_assessment') if isinstance(cs, dict) else getattr(cs, 'prior_action_assessment', None)
+							except Exception:
+								eval_prev = None
 							if eval_prev and idx > 1:  # Only show for steps after the first
 								eval_lines = eval_prev.strip().split('\n')
 								eval_summary = eval_lines[0]

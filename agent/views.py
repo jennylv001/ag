@@ -14,6 +14,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    field_validator,
     ValidationError,
     create_model,
     model_validator,
@@ -36,6 +37,9 @@ from browser_use.tokens.views import UsageSummary
 logger = logging.getLogger(__name__)
 
 ToolCallingMethod = Literal['function_calling', 'json_mode', 'raw', 'auto']
+
+
+# HistoryDeque removed - use standard deque directly
 
 
 class AgentStepInfo(BaseModel):
@@ -61,12 +65,15 @@ class ActionResult(BaseModel):
 
     @model_validator(mode='after')
     def validate_success(self):
+        # Enforce invariant: success=True can only be set when is_done=True
+        if self.success is True and self.is_done is not True:
+            raise ValueError("success=True can only be set when is_done=True. For regular actions that succeed, leave success as None. Use success=False only for actions that fail.")
+
         # If success is not explicitly set but there's an error, mark as failed
         if self.success is None and self.error is not None:
             self.success = False
-        # If success is not explicitly set and no error, mark as successful
-        elif self.success is None and self.error is None:
-            self.success = True
+        # If success is not explicitly set and no error, leave as None (avoid ambiguity during steps before done)
+
         return self
 
 
@@ -81,12 +88,200 @@ class StepMetadata(BaseModel):
         return self.step_end_time - self.step_start_time
 
 
-class AgentBrain(BaseModel):
-    """Brain snapshot for downstream components using the new schema names."""
-    thinking: Optional[str] = None
-    prior_action_assessment: str
-    task_log: str
-    next_goal: str
+# AgentBrain class removed - using dict directly in current_state property
+
+
+class TaskLogItem(BaseModel):
+    id: str
+    text: Optional[str] = None
+    name: Optional[str] = None
+    status: Optional[Literal['pending','in-progress','completed','blocked']] = None
+    parent_id: Optional[str] = None
+    priority: Optional[Literal['low','med','high']] = None
+    evidence: Optional[str] = None
+
+    @field_validator('status', mode='before')
+    @classmethod
+    def _normalize_status(cls, v):
+        if v is None:
+            return v
+        try:
+            raw = str(v).strip().lower().replace('_', '-').replace(' ', '-')
+            mapping = {
+                'todo': 'pending',
+                'to-do': 'pending',
+                'inprogress': 'in-progress',
+                'in-progress': 'in-progress',
+                'in-progresss': 'in-progress',
+                'in-progress.': 'in-progress',
+                'in-progress,': 'in-progress',
+                'in': 'in-progress',
+                'working': 'in-progress',
+                'done': 'completed',
+                'complete': 'completed',
+                'completed': 'completed',
+                'blocked': 'blocked',
+            }
+            return mapping.get(raw, raw)
+        except Exception:
+            return v
+
+    @field_validator('priority', mode='before')
+    @classmethod
+    def _normalize_priority(cls, v):
+        if v is None:
+            return v
+        try:
+            raw = str(v).strip().lower()
+            mapping_p = {
+                'mid': 'med',
+                'medium': 'med',
+                'med': 'med',
+                'low': 'low',
+                'high': 'high',
+            }
+            return mapping_p.get(raw, raw)
+        except Exception:
+            return v
+
+    @model_validator(mode='after')
+    def _normalize_and_fill(self) -> 'TaskLogItem':
+        """Normalize fields and ensure minimal invariants for robustness.
+
+        - Ensure `id` exists (auto-generate UUID if missing/blank).
+        - Normalize `status` to allowed set, mapping common variants.
+        - Normalize `priority` to allowed set, mapping common variants.
+        """
+        # ID: ensure non-empty
+        try:
+            if not getattr(self, 'id', None) or str(self.id).strip() == '':
+                self.id = str(uuid.uuid4())
+        except Exception:
+            self.id = str(uuid.uuid4())
+
+        # Status normalization
+        try:
+            if self.status is not None:
+                raw = str(self.status).strip().lower().replace('_', '-').replace(' ', '-')
+                # Common synonyms
+                mapping = {
+                    'todo': 'pending',
+                    'to-do': 'pending',
+                    'inprogress': 'in-progress',
+                    'in-progress': 'in-progress',
+                    'in-progresss': 'in-progress',
+                    'in-progress.': 'in-progress',
+                    'in-progress,': 'in-progress',
+                    'in progress': 'in-progress',
+                    'working': 'in-progress',
+                    'done': 'completed',
+                    'complete': 'completed',
+                    'completed': 'completed',
+                    'blocked': 'blocked',
+                }
+                self.status = mapping.get(raw, raw)  # type: ignore[assignment]
+        except Exception:
+            pass
+
+        # Priority normalization
+        try:
+            if self.priority is not None:
+                rawp = str(self.priority).strip().lower()
+                mapping_p = {
+                    'mid': 'med',
+                    'medium': 'med',
+                    'med': 'med',
+                    'low': 'low',
+                    'high': 'high',
+                }
+                self.priority = mapping_p.get(rawp, rawp)  # type: ignore[assignment]
+        except Exception:
+            pass
+
+        return self
+
+
+class TaskLog(BaseModel):
+    """Structured, domain-agnostic task log computed by the LLM each step."""
+    user_request: Optional[str] = None
+    objectives: Optional[List[TaskLogItem]] = None
+    checklist: Optional[List[TaskLogItem]] = None
+    next_action: Optional[str] = None
+    risks: Optional[List[str]] = None
+    blockers: Optional[List[str]] = None
+    progress_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    updated_at: Optional[str] = None
+
+    @field_validator('progress_pct', mode='before')
+    @classmethod
+    def _parse_progress_pct(cls, v):
+        """Accept strings like '35%' or numbers in 0-1 range and coerce to percent (0-100)."""
+        try:
+            if v is None:
+                return v
+            # Convert strings like "35%" or "35"
+            if isinstance(v, str):
+                s = v.strip()
+                if s.endswith('%'):
+                    s = s[:-1].strip()
+                v = float(s)
+            # If number appears to be a ratio in (0,1), scale to percent
+            if isinstance(v, (int, float)):
+                valf = float(v)
+                if 0.0 < valf < 1.0:
+                    valf = valf * 100.0
+                # Clamp here so Field(le=100) won't reject
+                if valf < 0.0:
+                    valf = 0.0
+                if valf > 100.0:
+                    valf = 100.0
+                return valf
+        except Exception:
+            return None
+        return v
+
+    @model_validator(mode='after')
+    def _normalize_fields(self) -> 'TaskLog':
+        """Normalize progress and timestamp for resilience against LLM drift.
+
+        - Accept progress as strings like "35%" or "0.35"; coerce to 0-100 float.
+        - Clamp to [0, 100].
+        - Populate updated_at in ISO-8601 UTC if missing.
+        """
+        # Clamp progress to [0, 100]
+        try:
+            if isinstance(self.progress_pct, (int, float)):
+                valf = float(self.progress_pct)
+                if valf < 0.0:
+                    valf = 0.0
+                if valf > 100.0:
+                    valf = 100.0
+                self.progress_pct = float(valf)
+        except Exception:
+            pass
+
+        # Ensure updated_at
+        try:
+            if not self.updated_at:
+                from datetime import datetime, timezone
+                self.updated_at = datetime.now(timezone.utc).isoformat()
+        except Exception:
+            pass
+
+        # Cap list sizes to bound payload drift from LLM
+        try:
+            def _cap_list(lst: Optional[List[Any]], n: int = 50) -> Optional[List[Any]]:
+                if isinstance(lst, list) and len(lst) > n:
+                    return lst[:n]
+                return lst
+            self.objectives = _cap_list(self.objectives, 50)
+            self.checklist = _cap_list(self.checklist, 50)
+            self.risks = _cap_list(self.risks, 50)
+            self.blockers = _cap_list(self.blockers, 50)
+        except Exception:
+            pass
+
+        return self
 
 
 class AgentOutput(BaseModel):
@@ -99,47 +294,85 @@ class AgentOutput(BaseModel):
     thinking: Optional[str] = None
     # New schema fields (preferred)
     prior_action_assessment: str
+    # Free-form task log for backward-compatibility with existing consumers
     task_log: str
+    # New preferred structured task log owned by the LLM (optional to avoid breaking callers)
+    task_log_structured: Optional[TaskLog] = None
     next_goal: str
     action: List[ActionModel] = Field(..., min_length=1)
 
     # No legacy parsing; inputs must provide the new schema keys.
 
+    @model_validator(mode='after')
+    def _ensure_structured_task_log(self) -> 'AgentOutput':
+        """Guarantee task_log_structured exists to simplify downstream logic.
+
+        - If missing, create a minimal skeleton so consumers can rely on the field.
+        - Keep it lightweight; do not infer content here (avoid accidental prompt bloat).
+        """
+        try:
+            if getattr(self, 'task_log_structured', None) is None:
+                self.task_log_structured = TaskLog()
+        except Exception:
+            # Never block model validation on this helper
+            pass
+        return self
+
+    # AgentBrain inlined - return fields directly
     @property
-    def current_state(self) -> AgentBrain:
-        """For backward compatibility with components expecting a nested 'AgentBrain'."""
-        return AgentBrain(
-            thinking=self.thinking,
-            prior_action_assessment=self.prior_action_assessment,
-            task_log=self.task_log,
-            next_goal=self.next_goal,
-        )
+    def current_state(self) -> dict:
+        """Return brain state as dict instead of nested AgentBrain wrapper."""
+        return {
+            'thinking': self.thinking,
+            'prior_action_assessment': self.prior_action_assessment or "",
+            'task_log': self.task_log or "",
+            'next_goal': self.next_goal or ""
+        }
 
     @staticmethod
-    def type_with_custom_actions(custom_actions: Type[ActionModel]) -> Type[AgentOutput]:
-        """Creates a dynamic AgentOutput type with a specific set of actions."""
+    def _type_with_custom_actions_base(custom_actions: Type[ActionModel], *, remove_thinking: bool) -> Type['AgentOutput']:
+        """Create a dynamic AgentOutput type with optional schema tweak to omit 'thinking'.
+
+        This consolidates the duplicated logic from the flash_mode and no_thinking variants.
+        """
+        base_cls: Type[AgentOutput]
+        if remove_thinking:
+            class _AgentOutputNoThinking(AgentOutput):
+                @classmethod
+                def model_json_schema(cls, **kwargs):  # type: ignore[override]
+                    schema = super().model_json_schema(**kwargs)
+                    if 'thinking' in schema.get('properties', {}):
+                        del schema['properties']['thinking']
+                    return schema
+            base_cls = _AgentOutputNoThinking
+        else:
+            base_cls = AgentOutput
+
         return create_model(
-            'AgentOutput',
-            __base__=AgentOutput,
-            action=(List[custom_actions], Field(..., min_length=1)), # type: ignore
+            'AgentOutputDynamic',
+            __base__=base_cls,
+            action=(List[custom_actions], Field(..., min_length=1)),  # type: ignore[arg-type]
         )
 
     @staticmethod
-    def type_with_custom_actions_no_thinking(custom_actions: Type[ActionModel]) -> Type[AgentOutput]:
+    def type_with_custom_actions(custom_actions: Type[ActionModel], *, remove_thinking: bool = False) -> Type['AgentOutput']:
+        """Creates a dynamic AgentOutput type with a specific set of actions.
+
+        Args:
+            custom_actions: The ActionModel type to use
+            remove_thinking: If True, omits the 'thinking' field from the schema (for flash_mode or no_thinking variants)
+        """
+        return AgentOutput._type_with_custom_actions_base(custom_actions, remove_thinking=remove_thinking)
+
+    @staticmethod
+    def type_with_custom_actions_flash_mode(custom_actions: Type[ActionModel]) -> Type['AgentOutput']:
+        """Creates a dynamic AgentOutput type optimized for flash_mode (no thinking field)."""
+        return AgentOutput.type_with_custom_actions(custom_actions, remove_thinking=True)
+
+    @staticmethod
+    def type_with_custom_actions_no_thinking(custom_actions: Type[ActionModel]) -> Type['AgentOutput']:
         """Creates a dynamic AgentOutput type that omits the 'thinking' field from its schema."""
-        class AgentOutputNoThinking(AgentOutput):
-            @classmethod
-            def model_json_schema(cls, **kwargs):
-                schema = super().model_json_schema(**kwargs)
-                if 'thinking' in schema.get('properties', {}):
-                    del schema['properties']['thinking']
-                return schema
-
-        return create_model(
-            'AgentOutputNoThinking',
-            __base__=AgentOutputNoThinking,
-            action=(List[custom_actions], Field(..., min_length=1)), # type: ignore
-        )
+        return AgentOutput.type_with_custom_actions(custom_actions, remove_thinking=True)
 
 
 class AgentHistory(BaseModel):
@@ -175,6 +408,11 @@ class AgentHistory(BaseModel):
                 'task_log': self.model_output.task_log,
                 'next_goal': self.model_output.next_goal,
                 'action': action_dump,  # This preserves the actual action data
+                'task_log_structured': (
+                    self.model_output.task_log_structured.model_dump(exclude_none=True)
+                    if getattr(self.model_output, 'task_log_structured', None)
+                    else None
+                ),
             }
             # Only include thinking if it's present
             if self.model_output.thinking is not None:
@@ -250,38 +488,6 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
 
         return cls.model_validate(data)
 
-    # def save_as_playwright_script(
-    #   self,
-    #   output_path: str | Path,
-    #   sensitive_data_keys: list[str] | None = None,
-    #   browser_config: BrowserConfig | None = None,
-    #   context_config: BrowserContextConfig | None = None,
-    # ) -> None:
-    #   """
-    #   Generates a Playwright script based on the agent's history and saves it to a file.
-    #   Args:
-    #       output_path: The path where the generated Python script will be saved.
-    #       sensitive_data_keys: A list of keys used as placeholders for sensitive data
-    #                            (e.g., ['username_placeholder', 'password_placeholder']).
-    #                            These will be loaded from environment variables in the
-    #                            generated script.
-    #       browser_config: Configuration of the original Browser instance.
-    #       context_config: Configuration of the original BrowserContext instance.
-    #   """
-    #   from browser_use.agent.playwright_script_generator import PlaywrightScriptGenerator
-
-    #   try:
-    #       serialized_history = self.model_dump()['history']
-    #       generator = PlaywrightScriptGenerator(serialized_history, sensitive_data_keys, browser_config, context_config)
-
-    #       script_content = generator.generate_script_content()
-    #       path_obj = Path(output_path)
-    #       path_obj.parent.mkdir(parents=True, exist_ok=True)
-    #       with open(path_obj, 'w', encoding='utf-8') as f:
-    #           f.write(script_content)
-    #   except Exception as e:
-    #       raise e
-
     def model_dump(self, **kwargs) -> dict[str, Any]:
         """Custom serialization that properly uses AgentHistory's model_dump"""
         return {
@@ -348,6 +554,21 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
             else:
                 return [h.state.screenshot for h in self.history[-n_last:] if h.state.screenshot is not None]
 
+    def screenshot_paths(self, n_last: int | None = None, return_none_if_not_screenshot: bool = True) -> list[str | None]:
+        """Get all screenshot paths from history"""
+        if n_last == 0:
+            return []
+        if n_last is None:
+            if return_none_if_not_screenshot:
+                return [h.state.screenshot_path if h.state.screenshot_path is not None else None for h in self.history]
+            else:
+                return [h.state.screenshot_path for h in self.history if h.state.screenshot_path is not None]
+        else:
+            if return_none_if_not_screenshot:
+                return [h.state.screenshot_path if h.state.screenshot_path is not None else None for h in self.history[-n_last:]]
+            else:
+                return [h.state.screenshot_path for h in self.history[-n_last:] if h.state.screenshot_path is not None]
+
     def action_names(self) -> list[str]:
         """Get all action names from history"""
         action_names = []
@@ -357,8 +578,8 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
                 action_names.append(actions[0])
         return action_names
 
-    def model_thoughts(self) -> list[AgentBrain]:
-        """Get all thoughts from history"""
+    def model_thoughts(self) -> list[dict]:
+        """Get all thoughts from history as dicts instead of AgentBrain objects"""
         return [h.model_output.current_state for h in self.history if h.model_output]
 
     def model_outputs(self) -> list[AgentOutput]:
@@ -384,6 +605,49 @@ class AgentHistoryList(BaseModel, Generic[AgentStructuredOutput]):
         for h in self.history:
             results.extend([r for r in h.result if r])
         return results
+
+    def action_history(self) -> list[list[dict]]:
+        """Get action history organized by step, with action fields, interacted_element, and long_term_memory.
+
+        Returns:
+            A list where each element is a list of action dictionaries for that step.
+            Each action dict contains:
+            - All action fields from action.model_dump(exclude_none=True)
+            - 'interacted_element': The DOM element that was interacted with
+            - 'long_term_memory': The long_term_memory from the corresponding result
+
+        Edge cases handled:
+        - Steps without model_output: append empty list
+        - Mismatched action/interacted_element lengths: zip truncates naturally
+        - None interacted_element: preserved as None
+        - Missing result or long_term_memory: preserved as None
+        """
+        step_actions = []
+
+        for h in self.history:
+            if not h.model_output:
+                # Step without model_output - append empty list
+                step_actions.append([])
+                continue
+
+            actions_for_step = []
+
+            # Zip actions with interacted elements (truncates if lengths don't match)
+            for i, (action, interacted_element) in enumerate(zip(h.model_output.action, h.state.interacted_element)):
+                action_dict = action.model_dump(exclude_none=True)
+                action_dict['interacted_element'] = interacted_element
+
+                # Get corresponding long_term_memory from result if available
+                if i < len(h.result) and h.result[i]:
+                    action_dict['long_term_memory'] = h.result[i].long_term_memory
+                else:
+                    action_dict['long_term_memory'] = None
+
+                actions_for_step.append(action_dict)
+
+            step_actions.append(actions_for_step)
+
+        return step_actions
 
     def extracted_content(self) -> list[str]:
         """Get all extracted content from history"""

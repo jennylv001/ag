@@ -11,9 +11,11 @@ from pathlib import Path
 from sys import stderr
 from typing import Any, ParamSpec, TypeVar, Dict, Optional
 import inspect
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
+import re
 
 from dotenv import load_dotenv
+from .timing import monotonic_seconds, now_utc_iso
 
 load_dotenv()
 
@@ -507,9 +509,9 @@ def time_execution_sync(additional_text: str = '') -> Callable[[Callable[P, R]],
 	def decorator(func: Callable[P, R]) -> Callable[P, R]:
 		@wraps(func)
 		def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-			start_time = time.time()
+			start_time = monotonic_seconds()
 			result = func(*args, **kwargs)
-			execution_time = time.time() - start_time
+			execution_time = monotonic_seconds() - start_time
 			# Only log if execution takes more than 0.25 seconds
 			if execution_time > 0.25:
 				self_has_logger = args and getattr(args[0], 'logger', None)
@@ -521,7 +523,7 @@ def time_execution_sync(additional_text: str = '') -> Callable[[Callable[P, R]],
 					logger = getattr(kwargs['browser_session'], 'logger')
 				else:
 					logger = logging.getLogger(__name__)
-				logger.debug(f'⏳ {additional_text.strip("-")}() took {execution_time:.2f}s')
+				logger.debug(f'⏳ {additional_text.strip("-")}() took {execution_time:.2f}s at {now_utc_iso()}')
 			return result
 
 		return wrapper
@@ -535,9 +537,9 @@ def time_execution_async(
 	def decorator(func: Callable[P, Coroutine[Any, Any, R]]) -> Callable[P, Coroutine[Any, Any, R]]:
 		@wraps(func)
 		async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-			start_time = time.time()
+			start_time = monotonic_seconds()
 			result = await func(*args, **kwargs)
-			execution_time = time.time() - start_time
+			execution_time = monotonic_seconds() - start_time
 			# Only log if execution takes more than 0.25 seconds to avoid spamming the logs
 			# you can lower this threshold locally when you're doing dev work to performance optimize stuff
 			if execution_time > 0.25:
@@ -550,7 +552,7 @@ def time_execution_async(
 					logger = getattr(kwargs['browser_session'], 'logger')
 				else:
 					logger = logging.getLogger(__name__)
-				logger.debug(f'⏳ {additional_text.strip("-")}() took {execution_time:.2f}s')
+				logger.debug(f'⏳ {additional_text.strip("-")}() took {execution_time:.2f}s at {now_utc_iso()}')
 			return result
 
 		return wrapper
@@ -829,50 +831,50 @@ def _log_pretty_url(s: str, max_len: int | None = 22) -> str:
 
 
 def redact_sensitive_data(text: str, sensitive_data_map: Optional[Dict[str, Any]]) -> str:
-    """
-    Redacts sensitive data values within a given text string.
+	"""
+	Redacts sensitive data values within a given text string.
 
-    Args:
-        text: The text to be redacted.
-        sensitive_data_map: A dictionary where keys are placeholders and values
-                            are the sensitive strings to be replaced.
+	Args:
+		text: The text to be redacted.
+		sensitive_data_map: A dictionary where keys are placeholders and values
+							are the sensitive strings to be replaced.
 
-    Returns:
-        The redacted text.
-    """
-    if not sensitive_data_map or not text:
-        return text
+	Returns:
+		The redacted text.
+	"""
+	if not sensitive_data_map or not text:
+		return text
 
-    # Flatten the map in case it's nested (like the domain-specific format)
-    all_secrets: Dict[str, str] = {}
-    for key, value in sensitive_data_map.items():
-        if isinstance(value, dict):
-            all_secrets.update({k: str(v) for k, v in value.items()})
-        else:
-            all_secrets[key] = str(value)
+	# Flatten the map in case it's nested (like the domain-specific format)
+	all_secrets: Dict[str, str] = {}
+	for key, value in sensitive_data_map.items():
+		if isinstance(value, dict):
+			all_secrets.update({k: str(v) for k, v in value.items()})
+		else:
+			all_secrets[key] = str(value)
 
-    # Create a single regex pattern to find any of the sensitive values.
-    # We sort by length descending to avoid issues where one secret is a substring of another.
-    # For example, to ensure "password123" is matched before "password".
-    sorted_values = sorted(
-        [v for v in all_secrets.values() if v],  # Filter out empty strings
-        key=len,
-        reverse=True
-    )
+	# Create a single regex pattern to find any of the sensitive values.
+	# We sort by length descending to avoid issues where one secret is a substring of another.
+	# For example, to ensure "password123" is matched before "password".
+	sorted_values = sorted(
+		[v for v in all_secrets.values() if v],  # Filter out empty strings
+		key=len,
+		reverse=True
+	)
 
-    if not sorted_values:
-        return text
+	if not sorted_values:
+		return text
 
-    # Escape special regex characters in the values
-    escaped_values = [re.escape(v) for v in sorted_values]
-    pattern = re.compile("|".join(escaped_values))
+	# Escape special regex characters in the values
+	escaped_values = [re.escape(v) for v in sorted_values]
+	pattern = re.compile("|".join(escaped_values))
 
-    # Use a replacer function to substitute with a generic placeholder
-    def replacer(match):
-        # This function is simple now but could be extended to show which key was matched
-        return "[SENSITIVE_DATA]"
+	# Use a replacer function to substitute with a generic placeholder
+	def replacer(match):
+		# This function is simple now but could be extended to show which key was matched
+		return "[SENSITIVE_DATA]"
 
-    return pattern.sub(replacer, text)
+	return pattern.sub(replacer, text)
 
 # NEWLY ADDED FUNCTION
 def get_tool_examples() -> str:
@@ -884,3 +886,54 @@ def get_tool_examples() -> str:
 Example of a tool call:
 {"thinking": "I need to find the main login button to proceed.", "action": {"click_element_by_index": {"index": 12}}}
 """
+
+
+# URL normalization helpers
+def normalize_url(url: str) -> str:
+	"""
+	Return a canonical URL string:
+	- default scheme to https if missing
+	- lowercase scheme and hostname
+	- drop default ports (80/443)
+	- remove URL fragments
+	- collapse root path '/'
+	"""
+	if not url:
+		return ''
+	s = url.strip()
+	# leave internal pages untouched
+	if s.startswith('about:') or s.startswith('chrome:'):
+		return s
+	parsed = urlparse(s if '://' in s else f'https://{s}')
+	scheme = (parsed.scheme or 'https').lower()
+	host = (parsed.hostname or '').lower()
+	if not host:
+		# not a URL; return original trimmed string
+		return s
+	# keep port only if non-default
+	port = parsed.port
+	if (scheme == 'http' and port == 80) or (scheme == 'https' and port == 443):
+		netloc = host
+	elif port:
+		netloc = f'{host}:{port}'
+	else:
+		netloc = host
+	path = parsed.path or ''
+	if path == '/':
+		path = ''
+	query = parsed.query or ''
+	# drop fragment
+	fragment = ''
+	return urlunparse((scheme, netloc, path, '', query, fragment))
+
+
+def normalize_domain(url_or_domain: str) -> str:
+	"""
+	Extract and normalize hostname (lowercase). Accepts bare domains or URLs.
+	"""
+	if not url_or_domain:
+		return ''
+	s = url_or_domain.strip()
+	parsed = urlparse(s if '://' in s else f'https://{s}')
+	host = (parsed.hostname or '').lower()
+	return host

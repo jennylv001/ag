@@ -138,7 +138,7 @@ async def main():
             browser_profile=browser_profile,
             use_planner=False,
             available_file_paths=available_file_paths,
-            
+
             # Enable failure-proof mode
             enable_long_running_mode=True,
             long_running_checkpoint_interval=300.0,  # 5 min checkpoints

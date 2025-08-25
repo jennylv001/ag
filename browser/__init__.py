@@ -6,6 +6,7 @@ if TYPE_CHECKING:
 	from .context import BrowserContext, BrowserContextConfig
 	from .profile import BrowserProfile
 	from .session import BrowserSession
+	from .flags import FlagsSummary, list_profile_flags, list_session_flags, list_chrome_arg_groups, summarize_flags, list_stealth_flags
 
 # Lazy imports mapping for heavy browser components
 _LAZY_IMPORTS = {
@@ -15,6 +16,12 @@ _LAZY_IMPORTS = {
 	'BrowserContextConfig': ('.context', 'BrowserContextConfig'),
 	'BrowserProfile': ('.profile', 'BrowserProfile'),
 	'BrowserSession': ('.session', 'BrowserSession'),
+	'FlagsSummary': ('.flags', 'FlagsSummary'),
+	'list_profile_flags': ('.flags', 'list_profile_flags'),
+	'list_session_flags': ('.flags', 'list_session_flags'),
+	'list_chrome_arg_groups': ('.flags', 'list_chrome_arg_groups'),
+	'list_stealth_flags': ('.flags', 'list_stealth_flags'),
+	'summarize_flags': ('.flags', 'summarize_flags'),
 }
 
 
@@ -38,4 +45,4 @@ def __getattr__(name: str):
 	raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
-__all__ = ['Browser', 'BrowserConfig', 'BrowserContext', 'BrowserContextConfig', 'BrowserSession', 'BrowserProfile']
+__all__ = ['Browser', 'BrowserConfig', 'BrowserContext', 'BrowserContextConfig', 'BrowserSession', 'BrowserProfile', 'FlagsSummary', 'list_profile_flags', 'list_session_flags', 'list_chrome_arg_groups', 'list_stealth_flags', 'summarize_flags']

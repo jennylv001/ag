@@ -103,8 +103,6 @@ from browser_use.browser.views import (
 from browser_use.browser.stealth import create_stealth_manager
 
 # Lazy imports for heavy DOM services to improve startup time
-# from browser_use.dom.clickable_element_processor.service import ClickableElementProcessor
-# from browser_use.dom.service import DomService
 from browser_use.dom.views import DOMElementNode, SelectorMap
 from browser_use.utils import (
 	is_new_tab_page,
@@ -354,6 +352,8 @@ class BrowserSession(BaseModel):
 	_current_page_loading_status: str | None = PrivateAttr(default=None)  # Track loading status for current page
 	_stealth_manager: Any = PrivateAttr(default=None)  # Stealth manager instance for human-like behavior
 	_stealth_enabled: bool = PrivateAttr(default=False)  # Whether stealth mode is active
+	# Centralized, flag-only stealth features (computed from profile.stealth and profile.advanced_stealth)
+	_stealth_features: dict[str, bool] = PrivateAttr(default_factory=dict)
 
 	# Task 6.2 & 7: In-memory stealth counters for observability
 	_stealth_counters: dict[str, int] = PrivateAttr(default_factory=lambda: {
@@ -511,6 +511,25 @@ class BrowserSession(BaseModel):
 
 			self.logger.info(f"📊 Session stealth summary: clicks={stealth_efficiency['clicks']}, typing={stealth_efficiency['typing']}, navigation={stealth_efficiency['navigation']}, scroll={stealth_efficiency['scroll']}, planning={stealth_efficiency['planning']}, typing_planning={stealth_efficiency['typing_planning']}{robustness_info}{planning_info}{typing_planning_info}{exploration_sequence_info}{error_simulation_info}")
 
+	def _compute_stealth_features(self) -> dict[str, bool]:
+		"""Compute enabled stealth features from two flags only: stealth and advanced_stealth.
+
+		Returns a dict with keys: entropy, behavioral_planning, page_exploration,
+		error_simulation, type, scroll, navigation.
+		"""
+		base = bool(getattr(self.browser_profile, 'stealth', False))
+		adv = bool(getattr(self.browser_profile, 'advanced_stealth', False))
+		features = {
+			'entropy': adv and base,
+			'behavioral_planning': adv and base,
+			'page_exploration': adv and base,
+			'error_simulation': adv and base,
+			'type': base,
+			'scroll': base,
+			'navigation': adv and base,
+		}
+		return features
+
 	@observe_debug(ignore_input=True, ignore_output=True, name='browser.session.start')
 	async def start(self) -> Self:
 		"""
@@ -582,9 +601,23 @@ class BrowserSession(BaseModel):
 			if self.browser_profile.executable_path
 			else (self.browser_profile.channel or BROWSERUSE_DEFAULT_CHANNEL).name.lower().replace('_', '-').replace(' ', '-')
 		)  # Google Chrome Canary.exe -> google-chrome-canary
-		driver_name = 'playwright'
+		# Determine driver name based on actual or intended backend
 		if self.browser_profile.stealth:
-			driver_name = 'patchright'
+			# Prefer actual instantiated object if available
+			try:
+				from browser_use.browser.types import Patchright as _PatchrightType  # type: ignore
+			except Exception:  # pragma: no cover
+				_PatchrightType = None  # type: ignore
+			driver_name = (
+				'patchright'
+				if (
+					(self.playwright is not None and _PatchrightType is not None and isinstance(self.playwright, _PatchrightType))
+					or os.environ.get('STEALTH_USE_PLAYWRIGHT_FIRST', 'false').lower() != 'true'
+				)
+				else 'playwright'
+			)
+		else:
+			driver_name = 'playwright'
 		return (
 			f'cdp_url={self.cdp_url}'
 			if self.cdp_url
@@ -613,8 +646,8 @@ class BrowserSession(BaseModel):
 			)
 			# Apply tight upper bound as requested, with optional slight jitter to avoid hard boundary
 			try:
-				import os, random
-				if getattr(self._stealth_manager, 'entropy_enabled', False) or os.environ.get('STEALTH_ENTROPY', 'false').lower() == 'true':
+				import random
+				if getattr(self._stealth_manager, 'entropy_enabled', False) or bool(self._stealth_features.get('entropy', False)):
 					cap = 0.56 + random.uniform(-0.06, 0.06)  # ~0.5-0.62s
 					cap = max(0.45, min(0.65, cap))
 					delay = min(delay, cap)
@@ -642,8 +675,8 @@ class BrowserSession(BaseModel):
 		Returns:
 			bool: True if stealth typing was used, False if fallback was used
 		"""
-		# Check if stealth typing is enabled via environment variable (default: True)
-		stealth_type_enabled = os.environ.get('STEALTH_TYPE', 'true').lower() == 'true'
+		# Check if stealth typing is enabled via centralized features
+		stealth_type_enabled = bool(self._stealth_features.get('type', False))
 
 		# Try stealth-enabled human-like typing first
 		if self._stealth_enabled and self._stealth_manager and stealth_type_enabled:
@@ -652,7 +685,7 @@ class BrowserSession(BaseModel):
 				if context is None:
 					context = {}
 
-				if os.environ.get('STEALTH_BEHAVIORAL_PLANNING', 'false').lower() == 'true' and not context.get('behavioral_planning'):
+				if bool(self._stealth_features.get('behavioral_planning', False)) and not context.get('behavioral_planning'):
 					try:
 						enhanced_context = await self._get_nearby_elements(element_handle, page)
 						context.update(enhanced_context)
@@ -776,8 +809,8 @@ class BrowserSession(BaseModel):
 		Returns:
 			bool: True if stealth navigation was used, False if fallback was used
 		"""
-		# Check if stealth navigation is enabled via environment variable (default: False for now due to compatibility issues)
-		stealth_navigation_enabled = os.environ.get('STEALTH_NAVIGATION', 'false').lower() == 'true'
+		# Check if stealth navigation is enabled via centralized features
+		stealth_navigation_enabled = bool(self._stealth_features.get('navigation', False))
 
 		# Try stealth-enabled human-like navigation first (only if explicitly enabled)
 		if self._stealth_enabled and self._stealth_manager and stealth_navigation_enabled:
@@ -822,8 +855,8 @@ class BrowserSession(BaseModel):
 		Returns:
 			bool: True if stealth scroll was used, False if fallback was used
 		"""
-		# Check if stealth scroll is enabled via environment variable (default: True)
-		stealth_scroll_enabled = os.environ.get('STEALTH_SCROLL', 'true').lower() == 'true'
+		# Check if stealth scroll is enabled via centralized features
+		stealth_scroll_enabled = bool(self._stealth_features.get('scroll', False))
 
 		# Try stealth-enabled human-like scrolling first
 		if self._stealth_enabled and self._stealth_manager and stealth_scroll_enabled:
@@ -1248,7 +1281,10 @@ class BrowserSession(BaseModel):
 		except RuntimeError:
 			current_loop = None
 
-		if is_stealth:
+		# Decide backend. In stealth mode, allow env override to prefer Playwright
+		use_patchright = bool(is_stealth) and (os.environ.get('STEALTH_USE_PLAYWRIGHT_FIRST', 'false').lower() != 'true')
+
+		if use_patchright:
 			GLOBAL_PATCHRIGHT_API_OBJECT = await async_patchright().start()
 			GLOBAL_PATCHRIGHT_EVENT_LOOP = current_loop
 			return GLOBAL_PATCHRIGHT_API_OBJECT
@@ -1269,9 +1305,10 @@ class BrowserSession(BaseModel):
 			current_loop = None
 
 		is_stealth = self.browser_profile.stealth
-		driver_name = 'patchright' if is_stealth else 'playwright'
-		global_api_object = GLOBAL_PATCHRIGHT_API_OBJECT if is_stealth else GLOBAL_PLAYWRIGHT_API_OBJECT
-		global_event_loop = GLOBAL_PATCHRIGHT_EVENT_LOOP if is_stealth else GLOBAL_PLAYWRIGHT_EVENT_LOOP
+		use_patchright = bool(is_stealth) and (os.environ.get('STEALTH_USE_PLAYWRIGHT_FIRST', 'false').lower() != 'true')
+		driver_name = 'patchright' if use_patchright else 'playwright'
+		global_api_object = GLOBAL_PATCHRIGHT_API_OBJECT if use_patchright else GLOBAL_PLAYWRIGHT_API_OBJECT
+		global_event_loop = GLOBAL_PATCHRIGHT_EVENT_LOOP if use_patchright else GLOBAL_PLAYWRIGHT_EVENT_LOOP
 
 		# Check if we need to create or recreate the global object
 		should_recreate = False
@@ -1317,8 +1354,13 @@ class BrowserSession(BaseModel):
 
 	async def _unsafe_close_browser(self) -> None:
 		"""Unsafe browser close logic without retry protection."""
-		if self.browser and self.browser.is_connected():
-			await self.browser.close()
+		# In persistent mode, self.browser may be None while self.browser_context exists.
+		try:
+			if self.browser and getattr(self.browser, 'is_connected', None) and self.browser.is_connected():
+				await self.browser.close()
+				self.browser = None
+		except Exception:
+			# Best-effort close; context close handles recordings
 			self.browser = None
 
 	@retry(
@@ -1421,30 +1463,52 @@ class BrowserSession(BaseModel):
 		"""
 		is_stealth = self.browser_profile.stealth
 
+		# Compute feature map from two flags only
+		self._stealth_features = self._compute_stealth_features()
+
 		# Configure browser channel based on stealth mode
 		if is_stealth:
-			# use patchright + chrome when stealth=True
+			# default to Chrome channel in stealth
 			self.browser_profile.channel = self.browser_profile.channel or BrowserChannel.CHROME
-			self.logger.info(f'🕶️ Activated stealth mode using patchright {self.browser_profile.channel.name.lower()} browser...')
+			# Determine backend for stealth
+			use_patchright = os.environ.get('STEALTH_USE_PLAYWRIGHT_FIRST', 'false').lower() != 'true'
+			backend_name = 'patchright' if use_patchright else 'playwright'
+			self.logger.info(
+				f'🕶️ Activated stealth mode{" (advanced)" if getattr(self.browser_profile, "advanced_stealth", False) else ""} '
+				f'using {backend_name} {self.browser_profile.channel.name.lower()} browser...'
+			)
 
 			# Initialize stealth manager for human-like behaviors with error handling
 			try:
 				self._stealth_manager = create_stealth_manager("random")
 				self._stealth_manager.session = self  # Add session reference for counter tracking
+				# Propagate feature toggles to manager (avoid env dependency inside manager)
+				try:
+					self._stealth_manager.entropy_enabled = bool(self._stealth_features.get('entropy', False))
+					self._stealth_manager.behavioral_planning_enabled = bool(self._stealth_features.get('behavioral_planning', False))
+					self._stealth_manager.page_exploration_enabled = bool(self._stealth_features.get('page_exploration', False))
+					self._stealth_manager.error_simulation_enabled = bool(self._stealth_features.get('error_simulation', False))
+					self._stealth_manager.navigation_enabled = bool(self._stealth_features.get('navigation', False))
+					self._stealth_manager.typing_enabled = bool(self._stealth_features.get('type', False))
+					self._stealth_manager.scroll_enabled = bool(self._stealth_features.get('scroll', False))
+					# Ensure engines reflect updated entropy flag
+					try:
+						self._stealth_manager.timing_engine.entropy_enabled = self._stealth_manager.entropy_enabled
+						self._stealth_manager.motion_engine.entropy_enabled = self._stealth_manager.entropy_enabled
+						self._stealth_manager.interaction_engine.entropy_enabled = self._stealth_manager.entropy_enabled
+					except Exception:
+						pass
+				except Exception:
+					pass
 				self._stealth_enabled = True
 				self.logger.info("🥷 Stealth manager initialized")
 				# Monitoring hook: increment stealth manager init count
 				self.logger.debug("📊 stealth.manager.init_count += 1")
-
-				# Parse and log behavioral planning environment variables
-				behavioral_planning_enabled = os.environ.get('STEALTH_BEHAVIORAL_PLANNING', 'false').lower() == 'true'
-				page_exploration_enabled = os.environ.get('STEALTH_PAGE_EXPLORATION', 'false').lower() == 'true'
-				error_simulation_enabled = os.environ.get('STEALTH_ERROR_SIMULATION', 'false').lower() == 'true'
-
-				# Monitoring hooks: Log environment variable states during stealth manager initialization
-				self.logger.debug(f"📊 stealth.env.behavioral_planning={behavioral_planning_enabled}")
-				self.logger.debug(f"📊 stealth.env.page_exploration={page_exploration_enabled}")
-				self.logger.debug(f"📊 stealth.env.error_simulation={error_simulation_enabled}")
+				# Log computed features for visibility
+				try:
+					self.logger.debug(f"📊 stealth.features={json.dumps(self._stealth_features)}")
+				except Exception:
+					pass
 
 			except Exception as e:
 				self.logger.warning(f"⚠️ Failed to initialize stealth manager: {type(e).__name__}: {e}")
@@ -1544,6 +1608,13 @@ class BrowserSession(BaseModel):
 				self.logger.warning(f'⚠️ Expected Chrome process with pid={self.browser_pid} is not running')
 				return
 			args = chrome_process.cmdline()
+			try:
+				cmd_preview = ' '.join(args)
+				if len(cmd_preview) > 1200:
+					cmd_preview = cmd_preview[:1200] + '…'
+				self.logger.debug(f"📊 existing_process.pid: {self.browser_pid} | cmdline: {cmd_preview}")
+			except Exception:
+				pass
 		except psutil.NoSuchProcess:
 			self.logger.warning(f'⚠️ Expected Chrome process with pid={self.browser_pid} not found, unable to (re-)connect')
 			return
@@ -1773,7 +1844,7 @@ class BrowserSession(BaseModel):
 					f'🌎 Created new empty browser_context in existing browser{storage_info}: {self.browser_context}'
 				)
 
-		# if we still have no browser_context by now, launch a new local one using launch_persistent_context()
+		# if we still have no browser_context by now, launch a new local one
 		if not self.browser_context:
 			assert self.browser_profile.channel is not None, 'browser_profile.channel is None'
 			self.logger.info(
@@ -1781,130 +1852,147 @@ class BrowserSession(BaseModel):
 				f'{str(type(self.playwright).__module__).split(".")[0]}:{self.browser_profile.channel.name.lower()} keep_alive={self.browser_profile.keep_alive or False} '
 				f'user_data_dir= {_log_pretty_path(self.browser_profile.user_data_dir) or "<incognito>"}'
 			)
-
-			# if no user_data_dir is provided, generate a unique one for this temporary browser_context (will be used to uniquely identify the browser_pid later)
-			if not self.browser_profile.user_data_dir:
-				# self.logger.debug('🌎 Launching local browser in incognito mode')
-				# if no user_data_dir is provided, generate a unique one for this temporary browser_context (will be used to uniquely identify the browser_pid later)
-				self.browser_profile.user_data_dir = self.browser_profile.user_data_dir or Path(
-					tempfile.mkdtemp(prefix='browseruse-tmp-')
+			# Log the final launch arguments we will pass to Chromium/Chrome for visibility
+			try:
+				assert self.playwright is not None, 'playwright instance is None'
+				resolved_executable = self.browser_profile.executable_path or self.playwright.chromium.executable_path
+				final_profile_args = self.browser_profile.get_args()
+				channel_name = (
+					self.browser_profile.channel.name.lower() if getattr(self.browser_profile, 'channel', None) else 'none'
 				)
-			# If we're reconnecting and using a temp directory, create a new one
-			# This avoids conflicts with the previous browser process that might still be shutting down
-			elif self.browser_profile.user_data_dir and Path(self.browser_profile.user_data_dir).name.startswith(
-				'browseruse-tmp-'
-			):
-				old_dir = self.browser_profile.user_data_dir
-				self.browser_profile.user_data_dir = Path(tempfile.mkdtemp(prefix='browseruse-tmp-'))
-				self.logger.debug(
-					f'🗑️ Cleaning up old tmp user_data_dir= {_log_pretty_path(old_dir)} and using fresh one:{_log_pretty_path(self.browser_profile.user_data_dir)}'
-				)
-				try:
-					shutil.rmtree(old_dir)
-				except Exception:
-					self.logger.warning(f'🗑️ Failed to cleanup old tmp user_data_dir= {_log_pretty_path(old_dir)}')
+				self.logger.info(f"📊 launch.channel: {channel_name}")
+				self.logger.info(f"📊 launch.executable_path: {resolved_executable}")
+				self.logger.info(f"📊 launch.stealth: {bool(self.browser_profile.stealth)} | headless: {self.browser_profile.headless}")
+				# Removed verbose args logging
+			except Exception as _log_e:
+				self.logger.debug(f"Failed to log launch metadata: {type(_log_e).__name__}: {_log_e}")
+			# Prepare persistent profile ONLY when explicitly provided
+			if self.browser_profile.user_data_dir:
+				# If we're reconnecting and using a temp directory, create a new one
+				# This avoids conflicts with the previous browser process that might still be shutting down
+				if Path(self.browser_profile.user_data_dir).name.startswith('browseruse-tmp-'):
+					old_dir = self.browser_profile.user_data_dir
+					self.browser_profile.user_data_dir = Path(tempfile.mkdtemp(prefix='browseruse-tmp-'))
+					self.logger.debug(
+						f'🗑️ Cleaning up old tmp user_data_dir= {_log_pretty_path(old_dir)} and using fresh one:{_log_pretty_path(self.browser_profile.user_data_dir)}'
+					)
+					try:
+						shutil.rmtree(old_dir)
+					except Exception:
+						self.logger.warning(f'🗑️ Failed to cleanup old tmp user_data_dir= {_log_pretty_path(old_dir)}')
+				# user data dir was provided, prepare it for use (handles conflicts automatically)
+				self.prepare_user_data_dir()
 
-			# user data dir was provided, prepare it for use (handles conflicts automatically)
-			self.prepare_user_data_dir()
-
-			# if a user_data_dir is provided, launch Chrome as subprocess then connect via CDP
+			# if a user_data_dir is provided, prefer stealth-safe launch methods
 			try:
 				async with asyncio.timeout(self.browser_profile.timeout / 1000):
 					try:
 						assert self.playwright is not None, 'playwright instance is None'
 
-						# Find an available port for remote debugging
-						import socket
-
-						with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-							s.bind(('127.0.0.1', 0))
-							s.listen(1)
-							debug_port = s.getsockname()[1]
-
-						# Get chromium executable path from browser profile or fall back to to playwright default
-						chromium_path = self.browser_profile.executable_path or self.playwright.chromium.executable_path
-
-						# Build chrome launch command with all args
-						chrome_args = self.browser_profile.get_args()
-
-						# Add/replace remote-debugging-port with our chosen port
-						final_args = []
-						for arg in chrome_args:
-							if not arg.startswith('--remote-debugging-port='):
-								final_args.append(arg)
-						final_args.extend(
-							[
-								f'--remote-debugging-port={debug_port}',
-								f'--user-data-dir={self.browser_profile.user_data_dir}',
-							]
+						# Choose launch strategy: in stealth mode, only persist if user explicitly provided a custom user_data_dir
+						user_dir = self.browser_profile.user_data_dir
+						try:
+							from browser_use.config import CONFIG as _CFG
+							resolved = Path(user_dir).expanduser().resolve() if user_dir else None
+							is_default_dir = bool(resolved) and (resolved == _CFG.BROWSER_USE_DEFAULT_USER_DATA_DIR)
+							is_default_like = bool(resolved) and (
+								resolved.parent == _CFG.BROWSER_USE_PROFILES_DIR and resolved.name.lower().startswith('default')
+							)
+						except Exception:
+							is_default_dir = False
+							is_default_like = False
+						# In stealth mode, only treat as persistent if the user provided a custom path
+						persistent_requested = bool(user_dir) and not (
+							self.browser_profile.stealth and (is_default_dir or is_default_like)
 						)
 
-						# Build final command
-						chrome_launch_cmd = [chromium_path] + final_args
-
-						# Launch chrome as subprocess
-						self.logger.info(
-							f' ↳ Spawning Chrome subprocess listening on CDP http://127.0.0.1:{debug_port}/ with user_data_dir= {_log_pretty_path(self.browser_profile.user_data_dir)}'
-						)
-
-						# Monitoring hook: log binary path once per session
-						self.logger.info(f"📊 spawn.binary_path: {chromium_path}")
-
-						process = await asyncio.create_subprocess_exec(
-							*chrome_launch_cmd,
-							stdout=asyncio.subprocess.PIPE,
-							stderr=asyncio.subprocess.PIPE,
-						)
-
-						# Store the subprocess reference for error handling
-						self._subprocess = process
-
-						# Store the browser PID
-						self.browser_pid = process.pid
-						self._set_browser_keep_alive(False)  # We launched it, so we should close it
-						self._owns_browser_resources = True  # We launched it, so we own it
-						# self.logger.debug(f'👶 Chrome subprocess launched with browser_pid={process.pid}')
-
-						# Use the existing setup_browser_via_browser_pid method to connect
-						# It will wait for the CDP port to become available
-						await self.setup_browser_via_browser_pid()
-
-						# If connection failed, browser will be None
-						if not self.browser:
-							# Try to get error info from the process
-							if process.returncode is not None:
-								# Chrome exited, try to read stderr for error message
-								stderr_output = ''
-								if process.stderr:
-									try:
-										stderr_bytes = await process.stderr.read()
-										stderr_output = stderr_bytes.decode('utf-8', errors='replace')
-									except Exception:
-										pass
-
-								# Check for common Chrome errors
-								if 'Failed parsing extensions' in stderr_output:
-									raise RuntimeError(
-										f'Failed parsing extensions: Chrome profile incompatibility detected. Chrome exited with code {process.returncode}'
-									)
-								elif 'SingletonLock' in stderr_output or 'ProcessSingleton' in stderr_output:
-									raise RuntimeError(f'SingletonLock error: {stderr_output[:500]}')
-								else:
-									# For any other error, raise hard error
-									self.logger.error(
-										f'❌ Chrome subprocess crashed with code {process.returncode}. Error: {stderr_output[:500] if stderr_output else "No error output"}'
-									)
-									raise RuntimeError(
-										f'Chrome subprocess crashed with code {process.returncode}. Error output: {stderr_output[:500] if stderr_output else "No error output"}'
-									)
-							else:
-								# Kill the subprocess if it's still running but we couldn't connect
+						if not persistent_requested:
+							# No user_data_dir provided -> run ephemeral (non-persistent) browser + context
+							self.logger.info(' ↳ Launching ephemeral context (no user_data_dir)')
+							# Re-log key launch parameters for the specific path
+							try:
+								chromium_path = self.browser_profile.executable_path or self.playwright.chromium.executable_path
+								path_args = self.browser_profile.get_args()
+								self.logger.info(f"📊 launch.path: ephemeral | binary: {chromium_path}")
+								# Removed verbose args logging
+							except Exception:
+								pass
+							# Direct launch keeps CDP internal to Playwright; safer than exposing a port
+							self.browser = await self.playwright.chromium.launch(
+								**self.browser_profile.kwargs_for_launch().model_dump(mode='json')
+							)
+							self.browser_context = await self.browser.new_context(
+								**self.browser_profile.kwargs_for_new_context().model_dump(mode='json')
+							)
+							self._set_browser_keep_alive(False)
+							self._owns_browser_resources = True
+						else:
+							# Persistent path only when user explicitly provided a user_data_dir
+							if self.browser_profile.stealth:
+								# User explicitly asked for persistent + stealth -> respect and use launch_persistent_context
+								self.logger.info(
+									f' ↳ Launching persistent context (explicit user_data_dir) user_data_dir= {_log_pretty_path(self.browser_profile.user_data_dir)}'
+								)
 								try:
-									process.terminate()
-									await process.wait()
+									chromium_path = self.browser_profile.executable_path or self.playwright.chromium.executable_path
+									path_args = self.browser_profile.get_args()
+									self.logger.info(f"📊 launch.path: persistent_context | binary: {chromium_path}")
+									# Removed verbose args logging
 								except Exception:
 									pass
-								raise RuntimeError(f'Failed to connect to Chrome subprocess on port {debug_port}')
+								ctx = await self.playwright.chromium.launch_persistent_context(
+									**self.browser_profile.kwargs_for_launch_persistent_context().model_dump(mode='json'),
+								)
+								self.browser_context = ctx
+								try:
+									self.browser = ctx.browser
+								except Exception:
+									self.browser = None
+								self._set_browser_keep_alive(False)
+								self._owns_browser_resources = True
+							else:
+								# Persistent + non-stealth: spawn subprocess and connect via CDP
+								import socket
+								with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+									s.bind(('127.0.0.1', 0))
+									s.listen(1)
+									debug_port = s.getsockname()[1]
+
+								chromium_path = self.browser_profile.executable_path or self.playwright.chromium.executable_path
+								chrome_args = self.browser_profile.get_args()
+								final_args = [a for a in chrome_args if not a.startswith('--remote-debugging-port=')]
+								final_args.extend([
+									f'--remote-debugging-port={debug_port}',
+									f'--user-data-dir={self.browser_profile.user_data_dir}',
+								])
+								chrome_launch_cmd = [chromium_path] + final_args
+								self.logger.info(
+									f' ↳ Spawning Chrome subprocess listening on CDP http://127.0.0.1:{debug_port}/ with user_data_dir= {_log_pretty_path(self.browser_profile.user_data_dir)}'
+								)
+								self.logger.info(f"📊 spawn.binary_path: {chromium_path}")
+								# Removed verbose args logging
+								process = await asyncio.create_subprocess_exec(
+									*chrome_launch_cmd,
+									stdout=asyncio.subprocess.PIPE,
+									stderr=asyncio.subprocess.PIPE,
+								)
+								self._subprocess = process
+								self.browser_pid = process.pid
+								self.logger.info(f"📊 spawn.pid: {self.browser_pid} | cdp_port: {debug_port}")
+								self._set_browser_keep_alive(False)
+								self._owns_browser_resources = True
+								await self.setup_browser_via_browser_pid()
+								if not self.browser:
+									stderr_output = ''
+									if process.returncode is not None and process.stderr:
+										try:
+											stderr_bytes = await process.stderr.read()
+											stderr_output = stderr_bytes.decode('utf-8', errors='replace')
+										except Exception:
+											pass
+									raise RuntimeError(
+										f'Failed to connect to Chrome subprocess on port {debug_port}: {stderr_output[:500] if stderr_output else ""}'
+									)
 
 					except Exception as e:
 						# Check if it's a SingletonLock error or Chrome subprocess exit error
@@ -2148,7 +2236,12 @@ class BrowserSession(BaseModel):
 			else:
 				raise
 
-		if self.browser_profile.stealth and not isinstance(self.playwright, Patchright):
+		# Only warn when stealth expected Patchright but we didn't explicitly opt into Playwright-first
+		if (
+			self.browser_profile.stealth
+			and not isinstance(self.playwright, Patchright)
+			and os.environ.get('STEALTH_USE_PLAYWRIGHT_FIRST', 'false').lower() != 'true'
+		):
 			self.logger.warning('⚠️ Failed to set up stealth mode. (...) got normal playwright objects as input.')
 
 		# Hide the exposed binding by making it non-enumerable on window for all pages
@@ -2488,14 +2581,23 @@ class BrowserSession(BaseModel):
 						pass
 				await self._show_dvd_screensaver_loading_animation(page)
 
-		page = page or (await self.browser_context.new_page())
+		# Do not force-create a persistent page here; other flows ensure at least one page exists when needed.
+		# Creating a page here can race with _setup_current_page_change_listeners() and lead to duplicate blank tabs.
+		page = page or (self.browser_context.pages[0] if self.browser_context.pages else None)
 
 		if (not viewport) and (self.browser_profile.window_size is not None) and not self.browser_profile.headless:
 			# attempt to resize the actual browser window
 
 			# cdp api: https://chromedevtools.github.io/devtools-protocol/tot/Browser/#method-setWindowBounds
+			created_temp = False
+			page_for_resize = page
 			try:
-				cdp_session = await page.context.new_cdp_session(page)  # type: ignore
+				# If no page exists yet, create a temporary one just for resizing, then close it
+				if page_for_resize is None:
+					page_for_resize = await self.browser_context.new_page()
+					created_temp = True
+
+				cdp_session = await page_for_resize.context.new_cdp_session(page_for_resize)  # type: ignore
 				window_id_result = await cdp_session.send('Browser.getWindowForTarget')
 				await cdp_session.send(
 					'Browser.setWindowBounds',
@@ -2511,11 +2613,19 @@ class BrowserSession(BaseModel):
 					await asyncio.wait_for(cdp_session.detach(), timeout=1.0)
 				except (TimeoutError, Exception):
 					pass
+				finally:
+					# Close the temporary page if we opened one to avoid leaving extra tabs
+					if created_temp and page_for_resize is not None:
+						try:
+							await page_for_resize.close()
+						except Exception:
+							pass
 			except Exception as e:
 				_log_size = lambda size: f'{size["width"]}x{size["height"]}px'
 				try:
 					# fallback to javascript resize if cdp setWindowBounds fails
-					await page.evaluate(
+					if page_for_resize is not None:
+						await page_for_resize.evaluate(
 						"""(width, height) => {window.resizeTo(width, height)}""",
 						[self.browser_profile.window_size['width'], self.browser_profile.window_size['height']],
 					)
@@ -3027,8 +3137,28 @@ class BrowserSession(BaseModel):
 			element_handle = await self.get_locate_element(element_node)
 
 			if element_handle is None:
-				self.logger.debug(f'Element: {repr(element_node)} not found')
-				raise Exception('Element not found')
+				 self.logger.debug(f'Element: {repr(element_node)} not found')
+				 # Coordinate-based fallback: attempt a viewport click if we have coordinates
+				 try:
+					 vc = getattr(element_node, 'viewport_coordinates', None)
+					 c = getattr(vc, 'center', None) if vc is not None else None
+					 if c is not None:
+						 x = float(getattr(c, 'x'))
+						 y = float(getattr(c, 'y'))
+						 # Basic validation
+						 if not (x is None or y is None):
+							 self.logger.debug(f"⚠️ Falling back to coordinate click at ({x:.1f}, {y:.1f}) for missing handle")
+							 await page.mouse.click(x, y)
+							 try:
+								 await page.wait_for_load_state()
+							 except Exception:
+								 pass
+							 await self._check_and_handle_navigation(page)
+							 return (None, stealth_used)
+				 except Exception as coord_e:
+					 self.logger.debug(f'Coordinate click fallback failed: {type(coord_e).__name__}: {coord_e}')
+				 # If no coordinates or fallback failed, propagate original not-found error
+				 raise Exception('Element not found')
 
 			async def perform_click(click_func):
 				"""Performs the actual click, handling both download and navigation scenarios."""
@@ -3089,74 +3219,59 @@ class BrowserSession(BaseModel):
 				# Check if coordinate-based stealth clicks are enabled (default: True)
 				stealth_coord_enabled = os.environ.get('STEALTH_COORD_CLICK', 'true').lower() == 'true'
 
+				# Capture outer page reference; avoid shadowing it locally
+				target_page = page
+
 				# Try stealth-enabled human-like click first
 				if self._stealth_enabled and self._stealth_manager and stealth_coord_enabled:
 					try:
 						center_x = None
 						center_y = None
 
-						# Task 7.2: Prefer DOM node coordinates when available
-						if element_node.viewport_coordinates and element_node.viewport_coordinates.center:
+						# Prefer Playwright bounding_box center after ensuring visibility
+						bounding_box = await element_handle.bounding_box()
+
+						# If bounding_box is None, try scroll and recompute
+						if bounding_box is None:
+							self.logger.debug("📊 stealth.click.rebbox_attempts += 1")
+							self._stealth_counters['stealth.click.rebbox_attempts'] += 1
+
 							try:
-								# Access and validate viewport coordinates
-								center_x = element_node.viewport_coordinates.center.x
-								center_y = element_node.viewport_coordinates.center.y
+								await element_handle.scroll_into_view_if_needed(timeout=2_000)
+								await asyncio.sleep(0.1)  # Brief wait for scroll to complete
+								bounding_box = await element_handle.bounding_box()
 
-								# Log raw coordinate data for debugging
-								self.logger.debug(
-									f"� Raw viewport coordinates: x={center_x} ({type(center_x).__name__}), "
-									f"y={center_y} ({type(center_y).__name__})"
-								)
+								if bounding_box is None:
+									# Still None after scroll - use fallback click
+									self.logger.debug("📊 stealth.click.no_bbox_fallback += 1")
+									self._stealth_counters['stealth.click.no_bbox_fallback'] += 1
+									await element_handle.click(timeout=1_500)
+									return False
+							except Exception as scroll_e:
+								self.logger.debug(f"Scroll into view failed: {type(scroll_e).__name__}")
 
-								# Attempt to convert to float if needed
-								center_x = float(center_x)
-								center_y = float(center_y)
-
-								# Verify values are valid numbers
-								if math.isnan(center_x) or math.isnan(center_y) or math.isinf(center_x) or math.isinf(center_y):
-									raise ValueError("Coordinates contain NaN or Infinity")
-
-								self.logger.debug(f"�📊 Using viewport_coordinates: x={center_x:.1f} y={center_y:.1f}")
-							except (ValueError, TypeError, AttributeError) as e:
-								self.logger.warning(f"⚠️ Invalid viewport coordinates: {str(e)}")
-								center_x = None
-								center_y = None
+						if bounding_box:
+							center_x = bounding_box['x'] + bounding_box['width'] / 2
+							center_y = bounding_box['y'] + bounding_box['height'] / 2
+							self.logger.debug(f"📊 Using bounding_box: x={center_x:.1f} y={center_y:.1f}")
 						else:
-							# Task 7.1: Fallback to bounding_box with safety enhancements
-							bounding_box = await element_handle.bounding_box()
-
-							# If bounding_box is None, try scroll and recompute (Task 7.1)
-							if bounding_box is None:
-								self.logger.debug("📊 stealth.click.rebbox_attempts += 1")
-								self._stealth_counters['stealth.click.rebbox_attempts'] += 1
-
+							# As a last resort, attempt viewport_coordinates center
+							if element_node.viewport_coordinates and element_node.viewport_coordinates.center:
 								try:
-									# Try to scroll element into view and recompute bbox
-									await element_handle.scroll_into_view_if_needed(timeout=2_000)
-									await asyncio.sleep(0.1)  # Brief wait for scroll to complete
-									bounding_box = await element_handle.bounding_box()
-
-									if bounding_box is None:
-										# Still None after scroll - use fallback click
-										self.logger.debug("📊 stealth.click.no_bbox_fallback += 1")
-										self._stealth_counters['stealth.click.no_bbox_fallback'] += 1
-										await element_handle.click(timeout=1_500)
-										return False  # Stealth was not used, but action completed
-								except Exception as scroll_e:
-									self.logger.debug(f"Scroll into view failed: {type(scroll_e).__name__}")
-									# Proceed with None bounding_box to trigger fallback
-
-							if bounding_box:
-								# Successfully got bounding box, compute center
-								center_x = bounding_box['x'] + bounding_box['width'] / 2
-								center_y = bounding_box['y'] + bounding_box['height'] / 2
-								self.logger.debug(f"📊 Using bounding_box: x={center_x:.1f} y={center_y:.1f}")
-							else:
-								# No coordinates available - use standard click fallback
-								self.logger.debug("📊 stealth.click.no_bbox_fallback += 1")
-								self._stealth_counters['stealth.click.no_bbox_fallback'] += 1
+									center_x = float(element_node.viewport_coordinates.center.x)
+									center_y = float(element_node.viewport_coordinates.center.y)
+									if math.isnan(center_x) or math.isnan(center_y) or math.isinf(center_x) or math.isinf(center_y):
+										raise ValueError("Coordinates contain NaN or Infinity")
+									self.logger.debug(f"📊 Using viewport_coordinates fallback: x={center_x:.1f} y={center_y:.1f}")
+								except (ValueError, TypeError, AttributeError) as e:
+									self.logger.warning(f"⚠️ Invalid viewport coordinates: {str(e)}")
+									center_x = None
+									center_y = None
+							if center_x is None or center_y is None:
+								self.logger.debug("📊 stealth.click.no_coords_fallback += 1")
+								self._stealth_counters['stealth.click.no_coords_fallback'] += 1
 								await element_handle.click(timeout=1_500)
-								return False  # Stealth was not used, but action completed
+								return False
 
 						# Execute stealth click if we have coordinates
 						if center_x is not None and center_y is not None:
@@ -3176,10 +3291,10 @@ class BrowserSession(BaseModel):
 
 								# Collect enhanced context for behavioral planning if enabled
 								context = {"complexity": 0.6}
-								if os.environ.get('STEALTH_BEHAVIORAL_PLANNING', 'false').lower() == 'true':
+								if bool(self._stealth_features.get('behavioral_planning', False)):
 									try:
-										page = await self.get_current_page()
-										enhanced_context = await self._get_nearby_elements(element_handle, page)
+										target_page = await self.get_current_page()
+										enhanced_context = await self._get_nearby_elements(element_handle, target_page)
 										context.update(enhanced_context)
 										context["behavioral_planning"] = True
 										self.logger.debug("📊 stealth.click.context_collected += 1")
@@ -3190,7 +3305,7 @@ class BrowserSession(BaseModel):
 
 								# Execute human-like click with enriched context
 								await self._stealth_manager.execute_human_like_click(
-									page, (center_x, center_y), context
+									target_page, (center_x, center_y), context
 								)
 
 								# Update counters based on behavioral planning usage
@@ -3396,6 +3511,15 @@ class BrowserSession(BaseModel):
 		timeout_ms = user_timeout_ms
 
 		# Handle new tab creation
+		if new_tab:
+			# If current tab is just a blank/new-tab page, prefer in-place navigation to avoid double-tab on first nav
+			try:
+				current = await self.get_current_page()
+				if current and is_new_tab_page(current.url):
+					new_tab = False
+			except Exception:
+				pass
+
 		if new_tab:
 			# Create new tab
 			assert self.browser_context is not None, 'Browser context is not set'
@@ -3743,19 +3867,6 @@ class BrowserSession(BaseModel):
 	def auto_download_pdfs(self) -> bool:
 		"""Get current PDF auto-download setting."""
 		return self._auto_download_pdfs
-
-	# @property
-	# def browser_extension_pages(self) -> list[Page]:
-	# 	if not self.browser_context:
-	# 		return []
-	# 	return [p for p in self.browser_context.pages if p.url.startswith('chrome-extension://')]
-
-	# @property
-	# def saved_downloads(self) -> list[Path]:
-	# 	"""
-	# 	Return a list of files in the downloads_path.
-	# 	"""
-	# 	return list(Path(self.browser_profile.downloads_path).glob('*'))
 
 	async def _wait_for_stable_network(self):
 		pending_requests = set()
@@ -4255,6 +4366,43 @@ class BrowserSession(BaseModel):
 
 		return self._cached_browser_state_summary
 
+	@observe_debug(ignore_input=True, name='get_affordances_summary')
+	@require_healthy_browser(usable_page=True, reopen_page=True)
+	@time_execution_async('--get_affordances_summary')
+	async def get_affordances_summary(self, *, viewport_expansion: int | None = None, ax_timeout_ms: int = 300) -> list[dict]:
+		"""Return a flat DOM+AX affordances list for the current page.
+
+		Each item has: index, role (optional), name (optional), viewport_coordinates, page_coordinates.
+		"""
+		from browser_use.dom.service import DomService
+		try:
+			page = await self.get_current_page()
+			# Fast-fail on unusable pages
+			if page is None or getattr(page, 'is_closed', lambda: True)():
+				self.logger.debug('get_affordances_summary: page is closed or unavailable, returning []')
+				return []
+			if not getattr(page, 'url', '') or is_new_tab_page(page.url) or page.url.startswith('chrome://'):
+				self.logger.debug(f'get_affordances_summary: skipping affordances for empty page: {getattr(page, "url", "")!r}')
+				return []
+
+			ds = DomService(page, logger=self.logger)
+			# Cap total wait with asyncio timeout even if AX call gets stuck
+			return await asyncio.wait_for(
+				ds.get_affordances(
+					viewport_expansion=viewport_expansion if viewport_expansion is not None else self.browser_profile.viewport_expansion,
+					interesting_only=True,
+					ax_timeout_ms=ax_timeout_ms,
+				),
+				timeout=max(1.0, min(10.0, (ax_timeout_ms or 300) / 1000.0 + 1.0)),
+			)
+		except asyncio.TimeoutError:
+			self.logger.warning('get_affordances_summary timed out; returning empty list to avoid stall')
+			return []
+		except Exception as e:
+			# Be resilient to TargetClosedError / disconnections
+			self.logger.debug(f'get_affordances_summary failed ({type(e).__name__}): {e}. Returning empty list')
+			return []
+
 	@observe_debug(ignore_input=True, ignore_output=True, name='get_minimal_state_summary')
 	@require_healthy_browser(usable_page=True, reopen_page=True)
 	@time_execution_async('--get_minimal_state_summary')
@@ -4301,6 +4449,8 @@ class BrowserSession(BaseModel):
 			url=url,
 			title=title,
 			tabs=tabs_info,
+			screenshot=None,  # No screenshot for minimal state
+			screenshot_path=None,  # No screenshot path for minimal state
 			pixels_above=0,
 			pixels_below=0,
 			browser_errors=[f'Page state retrieval failed, minimal recovery applied for {url}'],
@@ -4365,6 +4515,7 @@ class BrowserSession(BaseModel):
 					title='New Tab' if is_new_tab_page(page.url) else 'Chrome Page',
 					tabs=tabs_info,
 					screenshot=screenshot_b64,
+					screenshot_path=None,  # No screenshot for empty pages
 					page_info=page_info,
 					pixels_above=0,
 					pixels_below=0,
@@ -4394,13 +4545,14 @@ class BrowserSession(BaseModel):
 
 			dom_service = DomService(page, logger=self.logger)
 			try:
+				# Never draw overlays in normal runs; force highlight_elements=False for DOM extraction
 				content = await asyncio.wait_for(
 					dom_service.get_clickable_elements(
 						focus_element=focus_element,
 						viewport_expansion=self.browser_profile.viewport_expansion,
-						highlight_elements=self.browser_profile.highlight_elements,
+						highlight_elements=False,
 					),
-					timeout=45.0,  # 45 second timeout for DOM processing - generous for complex pages
+					timeout=45.0,
 				)
 				self.logger.debug('✅ DOM processing completed')
 			except TimeoutError:
@@ -4449,16 +4601,25 @@ class BrowserSession(BaseModel):
 			# 	)
 
 			if include_screenshot:
+				# Ensure any stray overlays are removed before taking screenshots
+				try:
+					await self.remove_highlights()
+				except Exception:
+					pass
 				try:
 					self.logger.debug('📸 Capturing screenshot...')
 					# Reasonable timeout for screenshot
 					screenshot_b64 = await self.take_screenshot()
+					# Save screenshot to disk and get path
+					screenshot_path = await self._save_screenshot_to_disk(screenshot_b64)
 					# self.logger.debug('✅ Screenshot completed')
 				except Exception as e:
 					self.logger.warning(f'❌ Screenshot failed for {_log_pretty_url(page.url)}: {type(e).__name__} {e}')
 					screenshot_b64 = None
+					screenshot_path = None
 			else:
 				screenshot_b64 = None
+				screenshot_path = None
 
 			# Get comprehensive page information
 			page_info = await self.get_page_info(page)
@@ -4492,13 +4653,60 @@ class BrowserSession(BaseModel):
 				title=title,
 				tabs=tabs_info,
 				screenshot=screenshot_b64,
+				screenshot_path=screenshot_path,
 				page_info=page_info,
+				affordances=None,
 				pixels_above=pixels_above,
 				pixels_below=pixels_below,
 				browser_errors=browser_errors,
 				is_pdf_viewer=is_pdf_viewer,
 				loading_status=self._current_page_loading_status,
 			)
+
+			# After page_info is known, optionally composite overlay boxes with correct scaling
+			try:
+				if (
+					self.browser_profile
+					and getattr(self.browser_profile, 'overlay_highlights_on_screenshots', False)
+					and self.browser_state_summary.screenshot
+				):
+					from browser_use.dom.overlay import overlay_highlights_on_screenshot
+					vw = getattr(page_info, 'viewport_width', None) or (self.browser_profile.viewport or {}).get('width')
+					vh = getattr(page_info, 'viewport_height', None) or (self.browser_profile.viewport or {}).get('height')
+					sx = getattr(page_info, 'scroll_x', None)
+					sy = getattr(page_info, 'scroll_y', None)
+					max_items = int(getattr(self.browser_profile, 'overlay_max_items', 60) or 60)
+					self.browser_state_summary.screenshot = overlay_highlights_on_screenshot(
+						self.browser_state_summary.screenshot,
+						self.browser_state_summary.selector_map,
+						max_items=max_items,
+						viewport_width=vw,
+						viewport_height=vh,
+						scroll_x=sx,
+						scroll_y=sy,
+					)
+				# Compute DOM+AX affordances for LLM consumption (truncated to match overlays)
+				try:
+					from browser_use.dom.service import DomService
+					ds = DomService(page, logger=self.logger)
+					# Enforce a guard timeout even if AX hangs internally
+					affs = await asyncio.wait_for(
+						ds.get_affordances(
+							viewport_expansion=self.browser_profile.viewport_expansion,
+							interesting_only=True,
+							ax_timeout_ms=300,
+						),
+						timeout=2.0,
+					)
+					# sort by index and cap to overlay_max_items for parity
+					if isinstance(affs, list):
+						affs = sorted(affs, key=lambda a: (a.get('index', 0) if isinstance(a, dict) else 0))
+						affs = affs[:max_items]
+					self.browser_state_summary.affordances = affs
+				except Exception:
+					self.browser_state_summary.affordances = None
+			except Exception as e:
+				self.logger.debug(f'Overlay compositing failed (ignored): {type(e).__name__}: {e}')
 
 			self.logger.debug('✅ get_state_summary completed successfully')
 			return self.browser_state_summary
@@ -4727,10 +4935,19 @@ class BrowserSession(BaseModel):
 				self.logger.error(f'❌ Browser process {self.browser_pid} no longer exists')
 				raise RuntimeError('Browser process has crashed - cannot recover unresponsive page')
 
-		# Check if browser connection is still alive
-		if self.browser and not self.browser.is_connected():
-			self.logger.error('❌ Browser connection lost - browser process may have crashed')
-			raise RuntimeError('Browser connection lost - cannot recover unresponsive page')
+		# Check if browser connection is still alive (handle persistent-context case)
+		try:
+			underlying_browser = None
+			if self.browser:
+				underlying_browser = self.browser
+			elif self.browser_context and getattr(self.browser_context, 'browser', None):
+				underlying_browser = self.browser_context.browser
+			if underlying_browser and hasattr(underlying_browser, 'is_connected') and not underlying_browser.is_connected():
+				self.logger.error('❌ Browser connection lost - browser process may have crashed')
+				raise RuntimeError('Browser connection lost - cannot recover unresponsive page')
+		except Exception:
+			# If we cannot determine, proceed with recovery steps anyway
+			pass
 
 		# Prevent re-entrance
 		self._in_recovery = True
@@ -4880,6 +5097,95 @@ class BrowserSession(BaseModel):
 			new_filename = f'{base} ({counter}){ext}'
 			counter += 1
 		return new_filename
+
+	async def _save_screenshot_to_disk(self, screenshot_b64: str) -> str | None:
+		r"""Save base64 screenshot to disk and return the file path."""
+		if not screenshot_b64:
+			return None
+
+		import base64
+		import tempfile
+		import time
+		from pathlib import Path
+		from urllib.parse import urlparse
+
+		def _sanitize_component(value: str, max_len: int = 80) -> str:
+			r"""Make a string safe for use in Windows filenames.
+			- remove query/fragment
+			- replace illegal characters <>:\"/\|?*
+			- collapse whitespace
+			- trim to max_len
+			- avoid trailing dots/spaces
+			"""
+			illegal = '<>:"/\\|?*'
+			# Replace illegal chars with '_'
+			for ch in illegal:
+				value = value.replace(ch, '_')
+			# Also replace spaces/semicolons and commas that can be awkward in paths
+			value = re.sub(r"\s+", "_", value)
+			value = value.replace(',', '_').replace(';', '_')
+			# Remove remaining non-printable
+			value = ''.join(c for c in value if 32 <= ord(c) <= 126)
+			# Trim length
+			value = value[:max_len]
+			# Strip trailing dots/spaces
+			return value.rstrip(' ._') or 'page'
+
+		try:
+			# Optional: Skip disk writes if system memory is critically high to avoid extra pressure
+			try:
+				mem = psutil.virtual_memory()  # type: ignore[attr-defined]
+				if getattr(mem, 'percent', 0) >= 93:
+					self.logger.warning('🧠 High memory usage detected, skipping screenshot save to disk to reduce pressure')
+					return None
+			except Exception:
+				pass
+
+			# Create a unique filename with timestamp
+			timestamp = int(time.time() * 1000)  # milliseconds for uniqueness
+			page = await self.get_current_page()
+			# Derive a safe hint from URL
+			url_hint = 'page'
+			try:
+				parsed = urlparse(page.url or '')
+				host = parsed.netloc or 'site'
+				path = parsed.path or ''
+				# drop query/fragment; include first path segment only
+				first_segment = (path.split('/')[:2])  # keep maybe 1 segment for context
+				path_hint = '_'.join(seg for seg in first_segment if seg)
+				url_hint = _sanitize_component(f"{host}_{path_hint}")
+			except Exception:
+				url_hint = 'page'
+
+			filename = f"screenshot_{timestamp}_{url_hint}.png"
+
+			# Use system temp directory for screenshots
+			temp_dir = Path(tempfile.gettempdir()) / "browser_use_screenshots"
+			temp_dir.mkdir(parents=True, exist_ok=True)
+
+			# Ensure not exceeding typical Windows MAX_PATH for the filename part (keep directory path separate)
+			if len(filename) > 120:
+				name, ext = os.path.splitext(filename)
+				filename = name[:116] + ext  # keep under 120 chars
+
+			# Avoid reserved device names on Windows
+			reserved = {"CON","PRN","AUX","NUL","COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9","LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"}
+			stem = os.path.splitext(filename)[0].upper()
+			if stem in reserved:
+				filename = f"_{filename}"
+
+			# Ensure uniqueness if file exists
+			filename = await self._get_unique_filename(str(temp_dir), filename)
+			screenshot_path = temp_dir / filename
+
+			# Decode and save screenshot
+			screenshot_data = base64.b64decode(screenshot_b64)
+			screenshot_path.write_bytes(screenshot_data)
+
+			return str(screenshot_path)
+		except Exception as e:
+			self.logger.warning(f"Failed to save screenshot to disk: {e}")
+			return None
 
 	async def _start_context_tracing(self):
 		"""Start tracing on browser context if trace_path is configured."""

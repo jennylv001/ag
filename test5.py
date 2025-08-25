@@ -2,7 +2,11 @@ import asyncio
 import logging
 import os
 import sys
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv  # optional
+except Exception:  # pragma: no cover
+    def load_dotenv():
+        return None
 
 # --- Setup: This ensures all imports work correctly ---
 # Assuming the script is in a 'tests' directory, and the library root is one level up.
@@ -99,64 +103,62 @@ async def main():
     logger.debug(f"Current asyncio event loop: {asyncio.get_event_loop().__class__.__name__}")
 
     agent_result = None
-    try:
-        llm_manager = RotatingGoogleClientManager(
-            api_keys=api_keys_list,
-            model=os.getenv("LLM_MODEL", "gemini-1.5-flash-latest")
-        )
+    llm_manager = RotatingGoogleClientManager(
+        api_keys=api_keys_list,
+        model=os.getenv("LLM_MODEL", "gemini-1.5-flash-latest")
+    )
 
+    browser_profile = BrowserProfile(
+        headless=False,
+        stealth=True,
+        user_data_dir=r"C:\Users\HeadOffice\Desktop\B\Directory",
+        executable_path=r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        browser_args=[]
+    )
 
+    # --- CORRECTED INITIALIZATION ---
+    # 1. Create the AgentSettings object first.
+    # Note: The original test passed `browser_config` and `telemetry_enabled`, which are not
+    # standard AgentSettings fields. I've mapped them correctly. `browser_config` is used
+    # to create a `BrowserProfile` for the agent. `telemetry_enabled` is not a direct
+    # setting, so it's omitted as it's likely handled by observability elsewhere.
+    # Directory that contains files allowed for upload. You can also whitelist specific files.
+    available_file_path = r"C:\Users\HeadOffice\Desktop\B\Dir"
+    available_file_paths = [available_file_path]
 
-        browser_profile = BrowserProfile(
-            headless=False,
-            stealth=True,
-            user_data_dir=r"C:\Users\HeadOffice\Desktop\B\Dir",
-            executable_path=r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            browser_args=[]
-        )
+    agent_settings = AgentSettings(
+        task=(
+            '''Find free job posting websites and aggregate a list of ten links then attempt job posting on each of them as Isla McKennon, hiring manager at Ginkgo Bioworks, email:"hiring@ginkgobioworks.us", Phone:"7318592040", City:"Boston", Zipcode:"02210", Job Post Title:"Remote Administrative Assistant". You are not an alumni of the University. [Rinse and Repeat, Ensure no website from the first set is included in the next and so on, save all succesful job posts to results.md."
+            "When filling up job posts, Use the logo in your file directory for uploads, path=C:\\Users\\HeadOffice\\Desktop\\B\\Dir\\logo.jpeg, if required."
+            "PROCEED WITH ACTIONS FROM UP TO DOWN, FIELD BY FIELD FILLING OUT THE REQUIRED ONES, DO NOT JUMP FIELDS, IF TWO CONSECUTIVE ERRORS OCCUR, "
+            "USE SCREENSHOT FOR VISUAL ANALYSIS OF THE PAGE AND MERGE INTO STATE, UPDATE YOUR REASONING, DONT RESTART PROCESSES, INSTEAD PERFORM ITERATIVE ACTION REFINEMENT"
+            "NOTE: THIS IS A LONG-RUNNING TASK, DO NOT GET STUCK, PIVOT, AVOID REPITITION, IF YOU HIT A DEADEND, PIVOT. DONT FIGHT THE SYSTEM, ADAPT. USE TODO.MD TO KEEP TRACK OF PROGRESS AND INSIGHTS.MD TO LEARN AS YOU PROGRESS. USE ONLY ACTIONS PROVIDED'''
+        ),
+        llm=llm_manager,
+        browser_profile=browser_profile,
+        use_planner=False,
+        use_task_planner=False,
+        task_layer_enabled=True,
+        available_file_paths=available_file_paths,
+        save_conversation_path=r"C:\Users\HeadOffice\Desktop\B\browser_use\Conversation",
+        default_search_engine='google',
 
-        # --- CORRECTED INITIALIZATION ---
-        # 1. Create the AgentSettings object first.
-        # Note: The original test passed `browser_config` and `telemetry_enabled`, which are not
-        # standard AgentSettings fields. I've mapped them correctly. `browser_config` is used
-        # to create a `BrowserProfile` for the agent. `telemetry_enabled` is not a direct
-        # setting, so it's omitted as it's likely handled by observability h  elsewhere.
-        # Directory that contains files allowed for upload. You can also whitelist specific files.
-        available_file_path = r"C:\Users\HeadOffice\Desktop\B\Dir"
-        available_file_paths = [available_file_path]
+        # Enable failure-proof mode
+        enable_long_running_mode=True,
+        long_running_checkpoint_interval=300.0,  # 5 min checkpoints
+        long_running_cpu_threshold_warning=95.0,  # Conservative thresholds
+        max_steps=10000,  # Allow extended operations
+        enable_modes=True,  # Health-aware behavior
+        long_running_enable_autonomous_continuation=True,  # The key setting!
+        long_running_max_consecutive_failures=20,  # Tolerant of failures
+        long_running_failure_escalation_delay=300.0,  # 5 minutes between escalations
+    )
 
+    # 2. Pass the single settings object to the Agent.
+    agent = Agent(settings=agent_settings)
 
-        agent_settings = AgentSettings(
-            task=(
-                '''Find free job posting websites and aggregate a list of ten links then attempt job posting on each of them as Isla McKennon, hiring manager at Ginkgo Bioworks, email:"hiring@ginkgobioworks.us", Phone:"7318592040", City:"Boston", Zipcode:"02210", Job Post Title:"Remote Administrative Assistant". You are not an alumni of the University. [Rinse and Repeat, Ensure no website from the first set is included in the next and so on, save all succesful job posts to results.md."
-                "When filling up job posts, Use the logo in your file directory for uploads, path=C:\\Users\\HeadOffice\\Desktop\\B\\Dir\\logo.jpeg, if required."
-                "PROCEED WITH ACTIONS FROM UP TO DOWN, FIELD BY FIELD FILLING OUT THE REQUIRED ONES, DO NOT JUMP FIELDS, IF TWO CONSECUTIVE ERRORS OCCUR, "
-                "USE SCREENSHOT FOR VISUAL ANALYSIS OF THE PAGE AND MERGE INTO STATE, UPDATE YOUR REASONING, DONT RESTART PROCESSES, INSTEAD PERFORM ITERATIVE ACTION REFINEMENT"
-                "NOTE: THIS IS A LONG-RUNNING TASK, DO NOT GET STUCK, PIVOT, AVOID RELENTLESS REPITITION, IF YOU HIT A DEADEND PIVOT, DONT FIGHT THE SYSTEM, ADAPT. USE TODO.MD TO KEEP TRACK OF PROGRESS AND INSIGHTS.MD TO LEARN AS YOU PROGRESS. USE ONLY ACTIONS PROVIDED'''
-            ),
-            llm=llm_manager,
-            browser_profile=browser_profile,
-            use_planner=False,
-            available_file_paths=available_file_paths,
-            
-            # Enable failure-proof mode
-            enable_long_running_mode=True,
-            long_running_checkpoint_interval=300.0,  # 5 min checkpoints
-            long_running_cpu_threshold_warning=95.0,  # Conservative thresholds
-            max_steps=10000,  # Allow extended operations
-            enable_modes=True,  # Health-aware behavior
-            long_running_enable_autonomous_continuation=True,  # The key setting!
-            long_running_max_consecutive_failures=20,  # Tolerant of failures
-            long_running_failure_escalation_delay=300.0,  # 5 minutes between escalations
-            )
-
-        # 2. Pass the single settings object to the Agent.
-        agent = Agent(settings=agent_settings)
-
-        agent_result = await agent.run()
-
-    except Exception as e:
-        logger.error("--- ❌ Agent run failed with an exception ---", exc_info=True)
+    # Run without an external per-test timeout; rely on internal timeouts
+    agent_result = await agent.run()
 
     if agent_result and agent_result.history:
         logger.info("--- ✅ Test PASSED ---")
@@ -166,4 +168,4 @@ async def main():
         logger.error("The agent did not return a valid result. This is likely due to the browser failing to start or the LLM call failing repeatedly.")
 
 if __name__ == "__main__":
-     asyncio.run(main())
+    asyncio.run(main())

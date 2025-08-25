@@ -95,6 +95,18 @@ class OllamaMessageSerializer:
 	def serialize(message: BaseMessage) -> Message:
 		"""Serialize a custom message to an Ollama Message."""
 
+		# Defensive check: if message is actually a string, convert to UserMessage
+		if isinstance(message, str):
+			from browser_use.llm.messages import UserMessage
+			message = UserMessage(content=message)
+
+		# Defensive check: if message doesn't have expected attributes, skip
+		if not hasattr(message, '__class__') or not hasattr(message, 'content'):
+			raise ValueError(f'Invalid message object: {type(message)} - must be a BaseMessage or string')
+
+		# Import here to avoid circular imports
+		from browser_use.llm.messages import UserMessage, SystemMessage, AssistantMessage
+
 		if isinstance(message, UserMessage):
 			text_content = OllamaMessageSerializer._extract_text_content(message.content)
 			images = OllamaMessageSerializer._extract_images(message.content)

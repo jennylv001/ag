@@ -2,10 +2,16 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal, TypeVar, overload
 
-from google import genai
-from google.auth.credentials import Credentials
-from google.genai import types
-from google.genai.types import MediaModality
+try:
+	from google import genai
+	from google.auth.credentials import Credentials
+	from google.genai import types
+	from google.genai.types import MediaModality
+except Exception as e:  # pragma: no cover - environment-specific dependency
+	raise ImportError(
+		"Google GenAI client not found. Install the official package: 'pip install google-genai'\n"
+		"If you previously installed older clients, prefer a clean env or ensure no conflicting 'google' namespace packages shadow it."
+	) from e
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel

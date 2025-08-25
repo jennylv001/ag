@@ -170,6 +170,18 @@ class AnthropicMessageSerializer:
 		handled separately as the system parameter in the API call, not as a message.
 		If a SystemMessage is passed here, it will be converted to a user message.
 		"""
+		# Defensive check: if message is actually a string, convert to UserMessage
+		if isinstance(message, str):
+			from browser_use.llm.messages import UserMessage
+			message = UserMessage(content=message)
+
+		# Defensive check: if message doesn't have expected attributes, skip
+		if not hasattr(message, '__class__') or not hasattr(message, 'content'):
+			raise ValueError(f'Invalid message object: {type(message)} - must be a BaseMessage or string')
+
+		# Import here to avoid circular imports
+		from browser_use.llm.messages import UserMessage, SystemMessage, AssistantMessage
+
 		if isinstance(message, UserMessage):
 			content = AnthropicMessageSerializer._serialize_content(message.content, use_cache=message.cache)
 			return MessageParam(role='user', content=content)
@@ -256,7 +268,15 @@ class AnthropicMessageSerializer:
 			return messages
 
 		# Create a copy to avoid modifying the original
-		cleaned_messages = [msg.model_copy(deep=True) for msg in messages]
+		# Handle cases where messages might contain strings or other non-Pydantic objects
+		cleaned_messages = []
+		for msg in messages:
+			if hasattr(msg, 'model_copy'):
+				cleaned_messages.append(msg.model_copy(deep=True))
+			else:
+				# For non-Pydantic objects (like strings), just append as-is
+				# This should not happen in normal cases, but provides defensive handling
+				cleaned_messages.append(msg)
 
 		# Find the last message with cache=True
 		last_cache_index = -1

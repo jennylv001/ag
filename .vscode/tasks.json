@@ -324,6 +324,53 @@
 			],
 			"isBackground": false,
 			"group": "build"
+		},
+		{
+			"label": "pytest - unit (new tests)",
+			"type": "shell",
+			"command": "..\\venv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"pytest",
+				"-q",
+				"tests\\unit\\test_perception_semantic_page.py",
+				"tests\\unit\\test_decision_maker_api.py",
+				"-q"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "pytest - unit (new tests) retry",
+			"type": "shell",
+			"command": "..\\venv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"pytest",
+				"-q",
+				"tests\\unit\\test_perception_semantic_page.py",
+				"tests\\unit\\test_decision_maker_api.py",
+				"-q"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "pytest - quick sanity (one-shot)",
+			"type": "shell",
+			"command": "..\\venv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"pytest",
+				"-q",
+				"tests\\e2e\\test_transition_engine.py",
+				"-q"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$pytest"
+			],
+			"group": "build"
 		}
 	]
 }

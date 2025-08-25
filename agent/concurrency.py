@@ -1,119 +1,52 @@
 """
 Concurrency utilities for the browser_use agent.
-Provides bulletproof lock wrapper and other concurrency primitives.
+Provides lightweight primitives for I/O and actuation coordination.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, Type
+from types import TracebackType
 from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
-
-class LockTimeoutError(Exception):
-    """Raised when a lock cannot be acquired within the timeout period."""
-    pass
+from ..exceptions import LockTimeoutError
 
 
-class bulletproof_lock:
-    """
-    A bulletproof asyncio.Lock wrapper with timeout and comprehensive error handling.
-
-    Usage:
-        async with bulletproof_lock(lock, timeout=3.0):
-            # critical section
-            pass
-    """
-
-    def __init__(self, lock: asyncio.Lock, timeout: float = 3.0):
-        self.lock = lock
-        self.timeout = timeout
-        self._acquired = False
-
-    async def __aenter__(self):
-        try:
-            # Try to acquire the lock with timeout
-            await asyncio.wait_for(self.lock.acquire(), timeout=self.timeout)
-            self._acquired = True
-            return self
-
-        except asyncio.TimeoutError:
-            import traceback
-            caller_info = traceback.format_stack()[-3].strip()  # Get calling location
-            error_msg = f"Failed to acquire lock within {self.timeout}s timeout"
-            logger.error(f"❌ LOCK TIMEOUT: {caller_info} - {error_msg}")
-            raise LockTimeoutError(error_msg) from None
-        except Exception as e:
-            error_msg = f"Unexpected error acquiring lock: {e}"
-            logger.error(error_msg, exc_info=True)
-            raise RuntimeError(error_msg) from e
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self._acquired:
-            try:
-                self.lock.release()
-            except Exception as e:
-                logger.error(f"Error releasing lock: {e}", exc_info=True)
-                # Don't raise here as it would mask the original exception
-            finally:
-                self._acquired = False
-
-        # Don't suppress any exceptions from the critical section
-        return False
+## NOTE: bulletproof_lock removed — it had no external usages. Prefer direct asyncio primitives.
 
 
-class ResourceSemaphore:
-    """
-    A wrapper around asyncio.Semaphore with additional tracking and logging.
-    """
+# ResourceSemaphore removed - use asyncio.Semaphore directly
 
-    def __init__(self, max_concurrent: int, name: str = "resource"):
-        self.semaphore = asyncio.Semaphore(max_concurrent)
-        self.max_concurrent = max_concurrent
-        self.name = name
-
-    async def __aenter__(self):
-        await self.semaphore.acquire()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self.semaphore.release()
-        return False
-
-    def locked(self) -> bool:
-        """Check if the semaphore is currently at its limit."""
-        return self.semaphore.locked()
-
-    @property
-    def available_permits(self) -> int:
-        """Get the number of available permits."""
-        return self.semaphore._value if hasattr(self.semaphore, '_value') else 0
-
-
-# Global semaphore for I/O operations - will be initialized by Supervisor
-_io_semaphore: Optional[ResourceSemaphore] = None
+# Global semaphore for I/O operations
+_io_semaphore: Optional[asyncio.Semaphore] = None
+_actuation_semaphore: Optional[asyncio.Semaphore] = None
 
 
 def set_global_io_semaphore(max_io: int):
-    """Initialize the global I/O semaphore. Called by Supervisor during setup."""
+    """Initialize the global I/O semaphore."""
     global _io_semaphore
-    _io_semaphore = ResourceSemaphore(max_io, "global_io")
+    _io_semaphore = asyncio.Semaphore(max_io)
     logger.info(f"Global I/O semaphore initialized with {max_io} permits")
 
 
-def get_global_io_semaphore() -> ResourceSemaphore:
-    """Get the global I/O semaphore. Raises if not initialized."""
+def set_single_actuation_semaphore():
+    """Initialize a single-permit semaphore for actuation."""
+    global _actuation_semaphore
+    if _actuation_semaphore is None:
+        _actuation_semaphore = asyncio.Semaphore(1)
+        logger.info("Single actuation semaphore initialized (1 permit)")
+
+
+def get_global_io_semaphore() -> asyncio.Semaphore:
+    """Get the global I/O semaphore (direct access)."""
     if _io_semaphore is None:
         raise RuntimeError("Global I/O semaphore not initialized. Call set_global_io_semaphore first.")
     return _io_semaphore
 
 
-async def with_io_semaphore():
-    """Context manager for I/O operations using the global semaphore."""
-    semaphore = get_global_io_semaphore()
-    return semaphore
 
 
 @asynccontextmanager
@@ -128,3 +61,50 @@ async def io_semaphore():
     sem = get_global_io_semaphore()
     async with sem:
         yield
+
+
+class LeaseToken:
+    """Opaque token representing an actuation lease."""
+    __slots__ = ("_ok",)
+    def __init__(self) -> None:
+        self._ok = True
+
+
+class ActuationLease:
+    """Acquire a single actuation lease ensuring only one component acts at a time.
+
+    Usage:
+        async with ActuationLease() as token:
+            await actuator.execute(decision)  # pass token if required
+    """
+
+    def __init__(self, timeout: float = 5.0):
+        self._timeout = timeout
+        self._token: Optional[LeaseToken] = None
+
+    async def __aenter__(self) -> LeaseToken:
+        global _actuation_semaphore
+        if _actuation_semaphore is None:
+            set_single_actuation_semaphore()
+        assert _actuation_semaphore is not None
+        try:
+            await asyncio.wait_for(_actuation_semaphore.acquire(), timeout=self._timeout)
+        except asyncio.TimeoutError as e:
+            raise LockTimeoutError("Failed to acquire ActuationLease within timeout") from e
+        self._token = LeaseToken()
+        return self._token
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> bool:
+        global _actuation_semaphore
+        if _actuation_semaphore is not None:
+            try:
+                _actuation_semaphore.release()
+            except Exception:
+                logger.debug("Actuation semaphore release error", exc_info=True)
+        self._token = None
+        return False

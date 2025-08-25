@@ -989,11 +989,16 @@ class HumanInteractionEngine:
             # Higher weights for wrong_focus when unfamiliar; premature_typing with impulsivity;
             # typo/typo_sequence with stress and error_proneness
             fam = float(self.behavioral_state.familiarity_score)
+            # IMPORTANT: Avoid depending on profile.error_proneness here because profiles are
+            # randomized per instance. Using it would break determinism across engines even
+            # when run_seed/action_seed are identical (as seen in tests). Instead, derive
+            # the "typo" tendency from behavioral state (stress) and a small base.
+            stress = float(self.behavioral_state.stress_level)
             weights = {
                 'wrong_focus': 0.3 + 0.7 * (1.0 - fam),
                 'premature_typing': 0.2 + 0.6 * float(self.profile.impulsivity),
-                'typo_sequence': 0.2 + 0.6 * float(self.behavioral_state.stress_level),
-                'typo': 0.3 + 0.7 * float(self.profile.error_proneness),
+                'typo_sequence': 0.2 + 0.6 * stress,
+                'typo': 0.25 + 0.5 * stress,
             }
             keys = list(weights.keys())
             total = sum(weights.values())
@@ -1179,8 +1184,14 @@ class StealthManager:
         self.profile = human_profile or HumanProfile.create_random_profile()
         self.behavioral_state = AgentBehavioralState()
 
-        # Feature flag: entropy mode (default off)
-        self.entropy_enabled = os.environ.get('STEALTH_ENTROPY', 'false').lower() == 'true'
+        # Feature flags (populated by session after construction)
+        self.entropy_enabled = False
+        self.behavioral_planning_enabled = False
+        self.page_exploration_enabled = False
+        self.error_simulation_enabled = False
+        self.navigation_enabled = False
+        self.typing_enabled = True
+        self.scroll_enabled = True
 
         # Initialize engines
         try:
@@ -1212,6 +1223,11 @@ class StealthManager:
 
         # Session tracking
         self.action_count = 0
+
+        # Initialize RNG attributes used in exploration methods
+        import random
+        self._rng = random.Random()
+        self._action_rng: Optional[random.Random] = None
 
         # Set up logger - integrate with main browser_use logging system
         self.logger = logging.getLogger("browser_use.stealth_manager")
@@ -1305,9 +1321,11 @@ class StealthManager:
                 raise
 
             # Check if behavioral planning is enabled
-            behavioral_planning_enabled = (element_context and
-                                         element_context.get('behavioral_planning', False) and
-                                         os.environ.get('STEALTH_BEHAVIORAL_PLANNING', 'false').lower() == 'true')
+            behavioral_planning_enabled = (
+                element_context
+                and element_context.get('behavioral_planning', False)
+                and getattr(self, 'behavioral_planning_enabled', False)
+            )
 
             if behavioral_planning_enabled:
                 self.logger.debug("🧠 Behavioral planning enabled, generating interaction plan")
@@ -1374,7 +1392,7 @@ class StealthManager:
             await asyncio.sleep(deliberation_time)
 
             # Check for standalone error simulation (not through behavioral planning)
-            standalone_error_simulation_enabled = os.environ.get('STEALTH_ERROR_SIMULATION', 'false').lower() == 'true'
+            standalone_error_simulation_enabled = bool(getattr(self, 'error_simulation_enabled', False))
             if standalone_error_simulation_enabled and not behavioral_planning_enabled:
                 should_simulate_error = self.interaction_engine._should_simulate_error()
                 if should_simulate_error:
@@ -1480,9 +1498,11 @@ class StealthManager:
                 pass
 
             # Check if behavioral planning is enabled for typing
-            behavioral_planning_enabled = (element_context and
-                                         element_context.get('behavioral_planning', False) and
-                                         os.environ.get('STEALTH_BEHAVIORAL_PLANNING', 'false').lower() == 'true')
+            behavioral_planning_enabled = (
+                element_context
+                and element_context.get('behavioral_planning', False)
+                and getattr(self, 'behavioral_planning_enabled', False)
+            )
 
             if behavioral_planning_enabled:
                 self.logger.debug("🧠 Behavioral planning enabled for typing, generating interaction plan")
@@ -1519,7 +1539,7 @@ class StealthManager:
                     )
 
                     # Execute pre-typing exploration if enabled and planned
-                    exploration_enabled = os.environ.get('STEALTH_PAGE_EXPLORATION', 'false').lower() == 'true'
+                    exploration_enabled = bool(getattr(self, 'page_exploration_enabled', False))
                     if exploration_enabled and interaction_plan.get('exploration_steps'):
                         self.logger.debug(f"🔍 Executing {len(interaction_plan['exploration_steps'])} exploration steps before typing")
                         exploration_metrics = await self._execute_exploration_sequence(
@@ -1562,7 +1582,7 @@ class StealthManager:
             await asyncio.sleep(deliberation_time)
 
             # Check for standalone error simulation (not through behavioral planning)
-            standalone_error_simulation_enabled = os.environ.get('STEALTH_ERROR_SIMULATION', 'false').lower() == 'true'
+            standalone_error_simulation_enabled = bool(getattr(self, 'error_simulation_enabled', False))
             if standalone_error_simulation_enabled and not behavioral_planning_enabled:
                 should_simulate_error = self.interaction_engine._should_simulate_error()
                 if should_simulate_error:

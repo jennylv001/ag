@@ -109,7 +109,15 @@ class AgentMessagePrompt:
 
 	@observe_debug(ignore_input=True, ignore_output=True, name='_get_browser_state_description')
 	def _get_browser_state_description(self) -> str:
-		elements_text = self.browser_state.element_tree.clickable_elements_to_string(include_attributes=self.include_attributes)
+		# Be defensive: element_tree may be None in minimal stubs/tests
+		try:
+			element_tree = getattr(self.browser_state, 'element_tree', None)
+			if element_tree and hasattr(element_tree, 'clickable_elements_to_string'):
+				elements_text = element_tree.clickable_elements_to_string(include_attributes=self.include_attributes)
+			else:
+				elements_text = ''
+		except Exception:
+			elements_text = ''
 
 		if len(elements_text) > self.max_clickable_elements_length:
 			elements_text = elements_text[: self.max_clickable_elements_length]
@@ -117,8 +125,8 @@ class AgentMessagePrompt:
 		else:
 			truncated_text = ''
 
-		has_content_above = (self.browser_state.pixels_above or 0) > 0
-		has_content_below = (self.browser_state.pixels_below or 0) > 0
+		has_content_above = (getattr(self.browser_state, 'pixels_above', 0) or 0) > 0
+		has_content_below = (getattr(self.browser_state, 'pixels_below', 0) or 0) > 0
 
 		# Enhanced page information for the model
 		page_info_text = ''
@@ -172,8 +180,29 @@ class AgentMessagePrompt:
 
 		# Check if current page is a PDF viewer and add appropriate message
 		pdf_message = ''
-		if self.browser_state.is_pdf_viewer:
+		if getattr(self.browser_state, 'is_pdf_viewer', False):
 			pdf_message = 'PDF viewer cannot be rendered. In this page, DO NOT use the extract_structured_data action as PDF content cannot be rendered. Use the read_file action on the downloaded PDF in available_file_paths to read the full content.\n\n'
+
+		# Render merged DOM+AX affordances if available (compact)
+		affordances_text = ''
+		try:
+			affs = getattr(self.browser_state, 'affordances', None)
+			if isinstance(affs, list) and affs:
+				lines = []
+				for a in affs:
+					if not isinstance(a, dict):
+						continue
+					idx = a.get('index')
+					role = a.get('role')
+					name = a.get('name')
+					vp = a.get('viewport_coordinates') or {}
+					# show minimal bbox for grounding
+					tl = (vp.get('top_left') or {}).get('y'), (vp.get('top_left') or {}).get('x')
+					br = (vp.get('bottom_right') or {}).get('y'), (vp.get('bottom_right') or {}).get('x')
+					lines.append(f"[{idx}] role={role or '-'} name={name or '-'} bbox=({tl[1]},{tl[0]})-({br[1]},{br[0]})")
+				affordances_text = 'Affordances (DOM+AX merged where available):\n' + '\n'.join(lines)
+		except Exception:
+			pass
 
 		browser_state = f"""{current_tab_text}
 Available tabs:
@@ -181,6 +210,7 @@ Available tabs:
 {page_info_text}
 {pdf_message}Interactive elements from top layer of the current page inside the viewport{truncated_text}:
 {elements_text}
+{affordances_text}
 """
 		return browser_state
 

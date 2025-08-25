@@ -1,0 +1,28 @@
+- [ ] Objective 1: Navigate to oregonbuys.gov
+    - [ ] Task 1.1: Go to "https://oregonbuys.gov"
+- [ ] Objective 2: Access Advanced Search
+    - [ ] Task 2.1: Locate and click "Advanced Search"
+- [ ] Objective 3: Filter by 'Blankets'
+    - [ ] Task 3.1: Identify the 'Classification' dropdown (or similar)
+    - [ ] Task 3.2: Select 'Blankets' from the dropdown
+    - [ ] Task 3.3: Wait 1 second for new fields to load
+- [ ] Objective 4: Filter by 'Department of Administration'
+    - [ ] Task 4.1: Identify the 'Organization' dropdown
+    - [ ] Task 4.2: Select 'Department of Administration'
+- [ ] Objective 5: Execute search
+    - [ ] Task 5.1: Click the 'Search' button
+- [ ] Objective 6: Iterate and extract data from search results (Loop until 200 pairs or no more results)
+    - [ ] Task 6.1: For each search result:
+        - [ ] Task 6.1.1: Click on the result to open its detail page
+        - [ ] Task 6.1.2: Extract 'purchaser name', 'purchaser email', 'contractor name', 'contractor email'
+        - [ ] Task 6.1.3: Store extracted data temporarily
+        - [ ] Task 6.1.4: Navigate back to search results
+        - [ ] Task 6.1.5: Keep track of aggregated pairs
+    - [ ] Task 6.2: Handle pagination to get more results if needed and if less than 200 pairs
+- [ ] Objective 7: Save extracted data to Google Sheets
+    - [ ] Task 7.1: Create a new Google Sheet.
+    - [ ] Task 7.2: Write the extracted data into the sheet.
+- [ ] Objective 8: Validate completeness
+    - [ ] Task 8.1: Verify if 200 pairs were extracted or if all available pairs were extracted and stored correctly.
+- [ ] Objective 9: Save the final page
+    - [ ] Task 9.1: Save the current page (likely the search results or a summary page) to a file.

@@ -58,7 +58,10 @@ class BrowserStateSummary(DOMState):
 	title: str
 	tabs: list[TabInfo]
 	screenshot: str | None = field(default=None, repr=False)
+	screenshot_path: str | None = field(default=None, repr=False)
 	page_info: PageInfo | None = None  # Enhanced page information
+	# Flat DOM+AX affordances merged by role+name when matched; primary text context for LLM
+	affordances: list[dict] | None = None
 
 	# Keep legacy fields for backward compatibility
 	pixels_above: int = 0

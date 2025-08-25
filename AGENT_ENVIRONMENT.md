@@ -179,3 +179,26 @@ subprocess.run([sys.executable, '-m', 'pytest', '-v'], check=False)
 print('ENVIRONMENT_READY: All systems operational for surgical precision coding')
 "
 ```
+
+-----
+
+#### 10. Planner/Replanning Feature Toggles
+
+- `use_task_planner` (bool, default: false): Enable the CDAD task planner to propose BaseTask sequences. Off by default to preserve current behavior and token budget.
+- `use_replanning` (bool, default: false): Enable reflection/replanning triggers (on failure, stagnation, or cadence). Off by default to avoid behavior drift.
+
+Single-flag cascade
+- When `use_task_planner=True`, the entire task abstraction layer is considered enabled, including planning, task runner/coordination, and replanning behaviors. A helper property `settings.task_layer_enabled` reflects this single switch, and `settings.replanning_enabled` will also be True when the single flag is on, regardless of `use_replanning`.
+
+Example:
+
+```python
+from browser_use.agent.settings import AgentSettings
+
+settings = AgentSettings(
+	task="Book a flight",
+	llm=my_llm,
+	use_task_planner=False,  # opt-in planner
+	use_replanning=False,    # opt-in reflection/replan
+)
+```

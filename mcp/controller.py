@@ -54,7 +54,9 @@ class MCPToolWrapper:
 		if self.session:
 			return  # Already connected
 
-		logger.info(f'🔌 Connecting to MCP server: {self.mcp_command} {" ".join(self.mcp_args)}')
+	# Avoid logging full raw args to reduce verbosity/sensitive exposure
+	args_preview = f"{len(self.mcp_args)} arg(s)"
+	logger.info(f'🔌 Connecting to MCP server: {self.mcp_command} ({args_preview})')
 
 		# Create server parameters
 		server_params = StdioServerParameters(command=self.mcp_command, args=self.mcp_args, env=None)

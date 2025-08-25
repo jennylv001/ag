@@ -1,11 +1,13 @@
 import logging
 import sys
+import locale
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from browser_use.config import CONFIG
+from browser_use.timing import now_utc_iso, uptime_seconds, process_start_utc_iso
 
 
 def addLoggingLevel(levelName, levelNum, methodName=None):
@@ -59,6 +61,41 @@ def addLoggingLevel(levelName, levelNum, methodName=None):
 	setattr(logging, methodName, logToRoot)
 
 
+class SafeStreamHandler(logging.StreamHandler):
+	"""A logging handler that gracefully handles consoles that can't encode emojis.
+
+	It retries writes with 'replace' on UnicodeEncodeError to avoid crashing tests on Windows cp1252.
+	"""
+
+	def emit(self, record):  # type: ignore[override]
+		"""Emit a record, sanitizing any non-encodable characters proactively.
+
+		Avoids calling the base StreamHandler.emit to prevent UnicodeEncodeError
+		from escaping on Windows cp1252 consoles. Always writes a sanitized string.
+		"""
+		try:
+			msg = self.format(record)
+			stream = self.stream
+			try:
+				# Try a normal write first
+				stream.write(msg + self.terminator)
+			except UnicodeEncodeError:
+				# Fallback: replace un-encodable characters
+				enc = getattr(stream, "encoding", None) or locale.getpreferredencoding(False) or "utf-8"
+				sanitized = msg.encode(enc, errors='replace').decode(enc, errors='replace')
+				stream.write(sanitized + self.terminator)
+			self.flush()
+		except Exception:
+			# Never let logging crash the app/tests
+			try:
+				stream = getattr(self, "stream", None)
+				if stream is not None:
+					stream.write("[log output suppressed due to logging error]\n")
+					self.flush()
+			except Exception:
+				pass
+
+
 def setup_logging(stream=None, log_level=None, force_setup=False):
 	"""Setup logging configuration for browser-use.
 
@@ -85,19 +122,25 @@ def setup_logging(stream=None, log_level=None, force_setup=False):
 
 	class BrowserUseFormatter(logging.Formatter):
 		def format(self, record):
-			# if isinstance(record.name, str) and record.name.startswith('browser_use.'):
-			# 	record.name = record.name.split('.')[-2]
+			# Inject time context
+			try:
+				record.utc = now_utc_iso()  # e.g., 2025-08-25T12:34:56.789Z
+				record.uptime = f"{uptime_seconds():.3f}s"
+			except Exception:
+				record.utc = ""
+				record.uptime = ""
 			return super().format(record)
 
 	# Setup single handler for all loggers
-	console = logging.StreamHandler(stream or sys.stdout)
+	console = SafeStreamHandler(stream or sys.stdout)
 
 	# adittional setLevel here to filter logs
 	if log_type == 'result':
 		console.setLevel('RESULT')
 		console.setFormatter(BrowserUseFormatter('%(message)s'))
 	else:
-		console.setFormatter(BrowserUseFormatter('%(levelname)-8s [%(name)s] %(message)s'))
+		# Show UTC timestamp and process uptime for every message
+		console.setFormatter(BrowserUseFormatter('%(levelname)-8s [%(name)s] %(utc)s (+%(uptime)s) %(message)s'))
 
 	# Configure root logger only
 	root.addHandler(console)
@@ -118,6 +161,10 @@ def setup_logging(stream=None, log_level=None, force_setup=False):
 
 	logger = logging.getLogger('browser_use')
 	# logger.info('BrowserUse logging setup complete with level %s', log_type)
+	try:
+		logger.debug(f"Logging initialized at {now_utc_iso()} (process_start={process_start_utc_iso()})")
+	except Exception:
+		pass
 	# Silence or adjust third-party loggers
 	third_party_loggers = [
 		'WDM',
